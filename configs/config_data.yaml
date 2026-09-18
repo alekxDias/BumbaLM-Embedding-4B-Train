@@ -1,0 +1,36 @@
+# Parametros de Preparacao de Dados, Chunking e Mineracao
+
+filtros:
+  min_caracteres_ementa: 50
+  min_caracteres_teor: 200
+  descartar_teor_menor_que_ementa: true
+  remover_html: true
+
+divisao_dados:
+  # Proporcoes da divisao (somatorio = 1.0)
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
+  
+  # Estrategia: agrupar 100% dos chunks do mesmo processo e estratificar por tribunal
+  agrupar_por: "numero_processo"
+  estratificar_por: "tribunal"
+
+chunking:
+  model_id_tokenizer: "Qwen/Qwen3-Embedding-4B"
+  chunk_size_tokens: 768
+  chunk_overlap_tokens: 128
+  
+  # Auditoria de vazamento do Chunk 0
+  auditar_vazamento_ementa: true
+  min_caracteres_contaminacao: 200
+
+mineracao_negativos:
+  n_negativos: 5
+  limiar_similaridade_min: 0.60
+  limiar_similaridade_max: 0.85
+  top_k_candidatos: 200
+  
+  # Lotes de mineracao acelerada em GPU
+  encode_batch_size: 256
+  query_batch_size: 256

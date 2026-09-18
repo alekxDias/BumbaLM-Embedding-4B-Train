@@ -1,0 +1,26 @@
+# Configuracoes Gerais e de Caminhos - Pipeline BumbaLM-Embedding-4B
+
+projeto:
+  nome: "BumbaLM-Embedding-4B-Train"
+  versao: "2.0.0"
+  descricao: "Pipeline modular para treinamento contrastivo de embeddings juridicos brasileiros"
+  seed: 42
+
+# Caminhos dos Dados
+# Edite 'caminho_dados_brutos' manualmente apontando para o .jsonl
+dados:
+  caminho_dados_brutos: ""
+  diretorio_processados: "data/processed"
+  
+  # Mapeamento flexivel de nomes de colunas do arquivo bruto
+  colunas:
+    tribunal: "str_tribunal"          # Coluna com sigla do tribunal (ex.: TJMA, TJSP, TRF1)
+    numero_processo: "str_numero_unico" # Coluna com numero CNJ ou identificador do processo
+    ementa: "str_ementa"              # Coluna com o texto da ementa (query)
+    inteiro_teor: "str_inteiro_teor"  # Coluna com o texto integral da decisao
+
+# Diretorios de Saida de Modelos e Logs
+saidas:
+  diretorio_experimentos: "experiments"
+  nome_experimento: "exp_001_h200_4b"
+  hf_cache_dir: "cache/huggingface"

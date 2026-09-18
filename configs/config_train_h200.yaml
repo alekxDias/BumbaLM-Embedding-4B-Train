@@ -1,0 +1,53 @@
+# Parametros de Treinamento Otimizados para GPU NVIDIA H200 (141 GB VRAM)
+
+modelo:
+  model_id: "Qwen/Qwen3-Embedding-4B"
+  max_seq_length: 768
+  query_instruction: "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: "
+  pooling_mode: "lasttoken"
+  normalizar_embeddings: true
+  
+  # Atencao Hopper: "sdpa" (nativo PyTorch 2.x) ou "flash_attention_2"
+  attn_implementation: "sdpa"
+
+treinamento:
+  # Lotes reais para explorar os 141 GB de VRAM e maximizar negativos in-batch
+  batch_size_train: 96
+  mini_batch_size: 96
+  gradient_accumulation_steps: 1
+  
+  # Otimizacao de memoria e velocidade
+  bf16: true
+  gradient_checkpointing: false # Desativado: usa a VRAM extra para acelerar backward
+  
+  # Otimizacao de alimentacao CPU -> GPU (GPU Starvation)
+  dataloader_num_workers: 8
+  dataloader_pin_memory: true
+  
+  # Otimizador e escalonamento
+  num_epochs: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  lr_scheduler_type: "cosine"
+  
+  # Frequencia de checkpoints e avaliacao
+  eval_steps: 250
+  save_steps: 250
+  save_total_limit: 2
+  metric_for_best_model: "val_cosine_ndcg@10"
+  greater_is_better: true
+
+loss:
+  nome: "CachedMultipleNegativesRankingLoss"
+  scale: 50.0
+
+avaliacao:
+  eval_batch_size: 128
+  metricas:
+    - "ndcg@10"
+    - "mrr@10"
+    - "accuracy@1"
+    - "accuracy@5"
+    - "accuracy@10"
+    - "map@100"
