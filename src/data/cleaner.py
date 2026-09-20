@@ -55,7 +55,7 @@ def limpar_texto(
     reduzir_divisores: bool = True,
 ) -> str:
     """
-    Higienizacao profunda de texto juridico para treinamento de embeddings.
+    Limpeza profunda de texto juridico para treinamento de embeddings.
 
     Etapas executadas:
     1. Conversao de entidades HTML (&nbsp;, &quot;, &atilde;, etc.) via html.unescape.
@@ -120,15 +120,15 @@ def carregar_e_filtrar_processos(
     remover_html: bool = True,
 ) -> tuple[list[ProcessoJudicial], dict[str, Any]]:
     """
-    Le o arquivo bruto JSONL, mapeia as colunas e aplica a higienizacao profunda
+    Le o arquivo bruto JSONL, mapeia as colunas e aplica a limpeza profunda
     junto aos filtros de qualidade e integridade.
 
     Filtros aplicados:
       - sem_numero_processo: registro sem identificador unico
       - processo_duplicado: processo ja visto com o mesmo id_global ({tribunal}_{numero})
       - campo_vazio: ementa ou inteiro teor ausentes
-      - ementa_curta: ementa menor que min_caracteres_ementa apos a higienizacao
-      - teor_curto: inteiro teor menor que min_caracteres_teor apos a higienizacao
+      - ementa_curta: ementa menor que min_caracteres_ementa apos a limpeza
+      - teor_curto: inteiro teor menor que min_caracteres_teor apos a limpeza
       - teor_menor_que_ementa: inconsistencia em que a decisao e menor que o proprio resumo
 
     Returns:
@@ -174,7 +174,7 @@ def carregar_e_filtrar_processos(
                 motivos_descarte["sem_numero_processo"] += 1
                 continue
 
-            # Aplica a higienizacao profunda
+            # Aplica a limpeza profunda
             ementa = limpar_texto(ementa_raw, remover_html=remover_html)
             teor = limpar_texto(teor_raw, remover_html=remover_html)
 
