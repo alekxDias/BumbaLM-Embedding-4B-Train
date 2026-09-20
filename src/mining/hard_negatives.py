@@ -47,11 +47,13 @@ def carregar_modelo_mineracao(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Carregando modelo de mineracao: {model_id} no dispositivo: {device}...")
+    dtype_modelo = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else (torch.float16 if device == "cuda" else torch.float32)
+
+    print(f"Carregando modelo de mineracao: {model_id} no dispositivo: {device} (dtype: {dtype_modelo})...")
     modelo = SentenceTransformer(
         model_id,
         model_kwargs={
-            "torch_dtype": torch.bfloat16 if device == "cuda" else torch.float32,
+            "torch_dtype": dtype_modelo,
             "trust_remote_code": True,
             "attn_implementation": attn_implementation if device == "cuda" else "eager",
         },
@@ -69,7 +71,7 @@ def encodar_textos_corpus(
     show_progress: bool = True,
 ) -> np.ndarray:
     """
-    Gera representacoes vetoriais normalizadas (norma L2 = 1.0) para todos os textos do corpus.
+    Gera representacoes vetoriais normalizadas para todos os textos do corpus.
     """
     embeddings = modelo.encode(
         textos,
@@ -79,42 +81,6 @@ def encodar_textos_corpus(
         convert_to_numpy=True,
     )
     return embeddings
-
-
-def selecionar_hard_negatives(
-    sims_q: np.ndarray,
-    sims_p: np.ndarray,
-    indices_mesmo_processo: list[int],
-    n_negativos: int = 5,
-    limiar_min: float = 0.60,
-    limiar_max: float = 0.85,
-    top_k: int = 200,
-) -> list[tuple[int, float]]:
-    """
-    Seleciona os melhores hard negatives para um determinado chunk positivo.
-
-    Estrategia de selecao:
-    1. Mascara estritamente todos os chunks pertencentes ao mesmo processo (evita falsos negativos).
-    2. Identifica os top_k chunks mais proximos vetorialmente da consulta (ementa).
-    3. Filtra apenas os candidatos dentro da faixa informatica [limiar_min, limiar_max].
-    4. Reordena os candidatos pela similaridade direta com o chunk positivo.
-    5. Retorna os n_negativos com maior similaridade com o chunk positivo dentro da faixa permitida.
-    """
-    sims_q_mascarado = sims_q.copy()
-    sims_q_mascarado[indices_mesmo_processo] = -np.inf
-    candidatos_top_k = np.argsort(sims_q_mascarado)[::-1][:top_k]
-
-    candidatos_validos = []
-    for idx in candidatos_top_k:
-        score_q = float(sims_q[idx])
-        if score_q < limiar_min or score_q > limiar_max:
-            continue
-        score_p = float(sims_p[idx])
-        candidatos_validos.append((int(idx), score_q, score_p))
-
-    # Ordena prioritariamente pela similaridade com o positivo, seguido pela query
-    candidatos_validos.sort(key=lambda x: (x[2], x[1]), reverse=True)
-    return [(idx, score_q) for idx, score_q, _ in candidatos_validos[:n_negativos]]
 
 
 def minerar_tripletos_contrastivos(
@@ -132,52 +98,43 @@ def minerar_tripletos_contrastivos(
     ignorar_chunk_0_como_positivo: bool = True,
 ) -> dict[str, Any]:
     """
-    Executa a mineracao de tripletos em lote utilizando aceleracao matricial na GPU.
+    Executa a mineracao em lote de tripletos.
 
-    Args:
-        modelo: Modelo SentenceTransformer carregado.
-        processos: Lista de processos judiciais de treino.
-        chunks_corpus: Colecao consolidada de chunks do treino.
-        arquivo_saida: Caminho do arquivo JSONL onde os tripletos serao salvos.
-        n_negativos: Quantidade de hard negatives por positivo (padrao: 5).
-        limiar_min: Similaridade minima com a query (padrao: 0.60).
-        limiar_max: Similaridade maxima com a query (padrao: 0.85).
-        top_k: Numero de candidatos preliminares examinados por query.
-        encode_batch_size: Lote de inferencia para vetorizar chunks.
-        query_batch_size: Lote de processos para comparacao matricial na GPU.
-        query_instruction: Prefixo de instrucao aplicado na query.
-        ignorar_chunk_0_como_positivo: Se True e houver outros chunks limpos no processo,
-            evita usar o Chunk 0 contaminado como documento positivo principal.
-
-    Returns:
-        Dicionario com estatisticas consolidadas da mineracao.
+    Otimizacoes:
+    - Processamento Vetorial Massivo: Multiplicacao matricial nativa na GPU utilizando precisao bfloat16.
+    - Mascaramento In-Place: Anulação imediata de candidatos pertencentes ao mesmo processo diretamente na memoria da GPU.
+    - Mitigacao de Gargalo de I/O: Execucao do torch.topk diretamente na GPU. Apenas os indices estritamente necessarios sao transferidos para a CPU.
+    - Avaliacao Focada: O calculo da similaridade de cosseno contra o texto positivo (ancora) e restrito ao subconjunto Top-K.
     """
     saida = Path(arquivo_saida)
     saida.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Mapeamentos e indexacao rapida
+    device = modelo.device
+    dtype_tensor = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else (torch.float16 if device.type == "cuda" else torch.float32)
+
+    # 1. Indexacao rapida de processos
     indices_por_processo: dict[str, list[int]] = defaultdict(list)
     for idx, ch in enumerate(chunks_corpus):
         indices_por_processo[ch.id_global_processo].append(idx)
 
     processos_validos = [p for p in processos if p.id_global in indices_por_processo]
     textos_corpus = [ch.texto for ch in chunks_corpus]
+    total_chunks = len(chunks_corpus)
 
-    print(f"Total de chunks a vetorizar: {len(chunks_corpus):,}")
+    print(f"Total de chunks a vetorizar: {total_chunks:,}")
     print(f"Total de processos para consulta: {len(processos_validos):,}")
 
     # 2. Vetorizacao de todo o corpus de chunks
     print("Gerando embeddings de todos os chunks do corpus ...")
-    corpus_embs = encodar_textos_corpus(
+    corpus_embs_cpu = encodar_textos_corpus(
         modelo=modelo,
         textos=textos_corpus,
         batch_size=encode_batch_size,
         show_progress=True,
     )
 
-    device = modelo.device
-    print(f"Carregando matriz de embeddings ({corpus_embs.shape}) na memoria de calculo ({device})...")
-    corpus_embs_tensor = torch.from_numpy(corpus_embs).to(device=device, dtype=torch.float32)
+    print(f"Transferindo matriz de embeddings ({corpus_embs_cpu.shape}) para {device} em {dtype_tensor}...")
+    corpus_embs_gpu = torch.from_numpy(corpus_embs_cpu).to(device=device, dtype=dtype_tensor)
 
     stats = {
         "processos_avaliados": 0,
@@ -188,10 +145,11 @@ def minerar_tripletos_contrastivos(
     }
 
     soma_margens = 0.0
+    k_candidatos_gpu = min(max(top_k * 2, n_negativos * 10), total_chunks)
 
     # 3. Processamento em lote das consultas
     with saida.open("w", encoding="utf-8") as f_out:
-        for start in tqdm(range(0, len(processos_validos), query_batch_size), desc="Minerando Tripletos"):
+        for start in tqdm(range(0, len(processos_validos), query_batch_size), desc="Minerando Tripletos (GPU Otimizada)"):
             batch_procs = processos_validos[start : start + query_batch_size]
             queries_formatadas = [
                 preparar_query_com_instrucao(p.ementa, query_instruction)
@@ -199,33 +157,58 @@ def minerar_tripletos_contrastivos(
             ]
 
             with torch.no_grad():
-                q_embs = modelo.encode(
+                # Vetorizacao em lote das consultas
+                q_embs_gpu = modelo.encode(
                     queries_formatadas,
                     batch_size=encode_batch_size,
                     normalize_embeddings=True,
                     convert_to_tensor=True,
                     show_progress_bar=False,
-                ).to(dtype=torch.float32)
+                ).to(dtype=dtype_tensor, device=device)
 
-                # Multiplicacao de matrizes: cos(queries_batch, corpus) -> Shape (B, N)
-                sims_queries_gpu = torch.matmul(q_embs, corpus_embs_tensor.T)
-                sims_queries = sims_queries_gpu.cpu().numpy()
+                # Multiplicacao de matrizes em lote na GPU: (B, D) x (D, N) -> Shape (B, N)
+                sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
 
+                # Mascara chunks do mesmo processo judicial diretamente na GPU
+                for i_local, proc in enumerate(batch_procs):
+                    pos_idx_list = indices_por_processo[proc.id_global]
+                    sims_batch_gpu[i_local, pos_idx_list] = -1e9
+
+                # Top-K direto na GPU: extrai apenas os candidatos mais proximos
+                top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
+
+                # Transfere para CPU apenas os indices e scores necessarios (array compacto)
+                top_scores_cpu = top_scores_gpu.cpu().float().numpy()
+                top_indices_cpu = top_indices_gpu.cpu().numpy()
+                q_embs_cpu = q_embs_gpu.cpu().float().numpy()
+
+            # Processamento rapido dos candidatos selecionados
             for i_local, proc in enumerate(batch_procs):
                 stats["processos_avaliados"] += 1
                 pos_indices = indices_por_processo[proc.id_global]
-                sims_q = sims_queries[i_local]
+                q_emb_vec = q_embs_cpu[i_local]
 
-                # Obtem embeddings dos positivos deste processo para cos(pos, corpus)
-                pos_embs_gpu = corpus_embs_tensor[pos_indices]
-                sims_p_gpu = torch.matmul(pos_embs_gpu, corpus_embs_tensor.T)
-                sims_p_matriz = sims_p_gpu.cpu().numpy()
+                cands_idx = top_indices_cpu[i_local]
+                cands_score_q = top_scores_cpu[i_local]
 
-                for j_local, pos_idx in enumerate(pos_indices):
+                # Filtra candidatos na faixa [limiar_min, limiar_max]
+                candidatos_validos = []
+                for c_idx, score_q in zip(cands_idx, cands_score_q):
+                    if limiar_min <= score_q <= limiar_max:
+                        candidatos_validos.append((int(c_idx), float(score_q)))
+
+                if len(candidatos_validos) < n_negativos:
+                    stats["chunks_sem_negativos_suficientes"] += len(pos_indices)
+                    continue
+
+                cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
+                cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
+                cand_embs_mat = corpus_embs_cpu[cand_indices_array]  # Shape (K, D)
+
+                for pos_idx in pos_indices:
                     ch_positivo = chunks_corpus[pos_idx]
 
-                    # Filtro inteligente do Chunk 0: se o chunk contem vazamento de ementa
-                    # e o processo possui outros chunks limpos, nao o usa como positivo
+                    # Filtro do Chunk 0: evita usar cabeçalho se houver outros chunks limpos
                     if (
                         ignorar_chunk_0_como_positivo
                         and ch_positivo.contem_vazamento_ementa
@@ -235,25 +218,26 @@ def minerar_tripletos_contrastivos(
 
                     stats["chunks_positivos_avaliados"] += 1
 
-                    negs = selecionar_hard_negatives(
-                        sims_q=sims_q,
-                        sims_p=sims_p_matriz[j_local],
-                        indices_mesmo_processo=pos_indices,
-                        n_negativos=n_negativos,
-                        limiar_min=limiar_min,
-                        limiar_max=limiar_max,
-                        top_k=top_k,
-                    )
+                    pos_emb_vec = corpus_embs_cpu[pos_idx]  # Shape (D,)
 
-                    if len(negs) < n_negativos:
+                    # Similaridade de cosseno com o positivo apenas sobre os candidatos: (K,)
+                    sims_p_array = np.dot(cand_embs_mat, pos_emb_vec)
+
+                    # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
+                    ordem = np.lexsort((cand_scores_q_array, sims_p_array))[::-1][:n_negativos]
+
+                    if len(ordem) < n_negativos:
                         stats["chunks_sem_negativos_suficientes"] += 1
                         continue
 
-                    score_pos = round(float(sims_q[pos_idx]), 4)
-                    neg_textos = [textos_corpus[idx] for idx, _ in negs]
-                    neg_scores = [round(s, 4) for _, s in negs]
-                    neg_ids = [chunks_corpus[idx].chunk_id for idx, _ in negs]
-                    margem = round(score_pos - max(neg_scores), 4)
+                    neg_indices_finais = cand_indices_array[ordem]
+                    neg_scores_finais = [round(float(s), 4) for s in cand_scores_q_array[ordem]]
+                    neg_textos = [textos_corpus[idx] for idx in neg_indices_finais]
+                    neg_ids = [chunks_corpus[idx].chunk_id for idx in neg_indices_finais]
+
+                    # Calcula score exato da query com o positivo
+                    score_pos = round(float(np.dot(q_emb_vec, pos_emb_vec)), 4)
+                    margem = round(score_pos - max(neg_scores_finais), 4)
 
                     registro = {
                         "id_global": proc.id_global,
@@ -266,7 +250,7 @@ def minerar_tripletos_contrastivos(
                         "negatives": neg_textos,
                         "negative_chunk_ids": neg_ids,
                         "score_positive": score_pos,
-                        "scores_negativos": neg_scores,
+                        "scores_negativos": neg_scores_finais,
                         "margin": margem,
                     }
 
@@ -274,7 +258,7 @@ def minerar_tripletos_contrastivos(
                     stats["tripletos_salvos"] += 1
                     soma_margens += margem
 
-            if torch.cuda.is_available():
+            if device.type == "cuda":
                 torch.cuda.empty_cache()
 
     if stats["tripletos_salvos"] > 0:
