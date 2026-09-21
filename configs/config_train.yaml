@@ -1,4 +1,4 @@
-# Parametros de Treinamento Otimizados para GPU NVIDIA H200 (141 GB VRAM)
+# Parametros de Treinamento
 
 modelo:
   model_id: "Qwen/Qwen3-Embedding-4B"
@@ -7,7 +7,7 @@ modelo:
   pooling_mode: "lasttoken"
   normalizar_embeddings: true
   
-  # Atencao Hopper: "sdpa" (nativo PyTorch 2.x) ou "flash_attention_2"
+  # "sdpa" (nativo PyTorch 2.x) ou "flash_attention_2"
   attn_implementation: "sdpa"
 
 treinamento:
@@ -18,7 +18,7 @@ treinamento:
   
   # Otimizacao de memoria e velocidade
   bf16: true
-  gradient_checkpointing: false # Desativado: usa a VRAM extra para acelerar backward
+  gradient_checkpointing: false # Desativado: usa a VRAM extra
   
   # Otimizacao de alimentacao CPU -> GPU (GPU Starvation)
   dataloader_num_workers: 8

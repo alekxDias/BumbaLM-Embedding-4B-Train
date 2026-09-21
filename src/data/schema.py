@@ -49,6 +49,10 @@ class ProcessoJudicial:
         self.ementa = str(self.ementa or "").strip()
         self.inteiro_teor = str(self.inteiro_teor or "").strip()
 
+    @property
+    def id(self) -> str:
+        return self.id_global
+
     def to_dict(self) -> dict[str, Any]:
         """Converte o registro para formato serializavel em JSONL."""
         return {
@@ -59,6 +63,17 @@ class ProcessoJudicial:
             "str_inteiro_teor": self.inteiro_teor,
             "metadados": self.metadados,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ProcessoJudicial:
+        """Instancia ProcessoJudicial a partir de dicionario JSON."""
+        return cls(
+            tribunal=data.get("str_tribunal", data.get("tribunal", "")),
+            numero_processo=data.get("str_numero_unico", data.get("numero_processo", "")),
+            ementa=data.get("str_ementa", data.get("ementa", "")),
+            inteiro_teor=data.get("str_inteiro_teor", data.get("inteiro_teor", "")),
+            metadados=data.get("metadados", {}),
+        )
 
 
 @dataclass
@@ -76,6 +91,18 @@ class ChunkProcesso:
     contem_vazamento_ementa: bool = False
     motivo_vazamento: Optional[str] = None
 
+    @property
+    def processo_id(self) -> str:
+        return self.id_global_processo
+
+    @property
+    def is_ementa_leak(self) -> bool:
+        return self.contem_vazamento_ementa
+
+    @property
+    def motivo_leak(self) -> Optional[str]:
+        return self.motivo_vazamento
+
     def to_dict(self) -> dict[str, Any]:
         """Converte o chunk para formato serializavel em JSONL."""
         return {
@@ -89,3 +116,18 @@ class ChunkProcesso:
             "contem_vazamento_ementa": self.contem_vazamento_ementa,
             "motivo_vazamento": self.motivo_vazamento,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ChunkProcesso:
+        """Instancia ChunkProcesso a partir de dicionario JSON."""
+        return cls(
+            chunk_id=data.get("chunk_id", ""),
+            id_global_processo=data.get("id_global_processo", data.get("processo_id", "")),
+            tribunal=data.get("str_tribunal", data.get("tribunal", "")),
+            numero_processo=data.get("str_numero_unico", data.get("numero_processo", "")),
+            chunk_idx=int(data.get("chunk_idx", data.get("chunk_index", 0))),
+            n_tokens=int(data.get("n_tokens", data.get("num_tokens", 0))),
+            texto=data.get("texto", ""),
+            contem_vazamento_ementa=bool(data.get("contem_vazamento_ementa", data.get("is_ementa_leak", False))),
+            motivo_vazamento=data.get("motivo_vazamento", data.get("motivo_leak")),
+        )

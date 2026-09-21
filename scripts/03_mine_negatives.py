@@ -67,8 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--config_train",
         type=Path,
-        default=BASE_DIR / "configs" / "config_train_h200.yaml",
-        help="Caminho do config_train_h200.yaml",
+        default=BASE_DIR / "configs" / "config_train.yaml",
+        help="Caminho do config_train.yaml",
     )
     parser.add_argument(
         "--data_dir",
