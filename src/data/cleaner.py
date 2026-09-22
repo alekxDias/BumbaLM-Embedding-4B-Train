@@ -165,10 +165,10 @@ def carregar_e_filtrar_processos(
                 motivos_descarte["registro_nao_dicionario"] += 1
                 continue
 
-            tribunal = str(dado.get(col_tribunal) or "").strip()
-            numero = str(dado.get(col_numero) or "").strip()
-            ementa_raw = str(dado.get(col_ementa) or "").strip()
-            teor_raw = str(dado.get(col_teor) or "").strip()
+            tribunal = str(dado.get(col_tribunal) or dado.get("tribunal") or dado.get("str_tribunal") or "").strip()
+            numero = str(dado.get(col_numero) or dado.get("str_numero_unico") or dado.get("numero_processo") or dado.get("numero") or "").strip()
+            ementa_raw = str(dado.get(col_ementa) or dado.get("str_ementa") or dado.get("ementa") or "").strip()
+            teor_raw = str(dado.get(col_teor) or dado.get("str_inteiro_teor") or dado.get("inteiro_teor") or "").strip()
 
             if not numero:
                 motivos_descarte["sem_numero_processo"] += 1

@@ -214,8 +214,15 @@ def main() -> None:
     relatorio_consolidado_geral: dict[str, Any] = {}
 
     for split_nome in splits_para_avaliar:
+        nome_pt = "teste" if split_nome == "test" else ("validacao" if split_nome == "val" else "treino")
+        
         arq_processos = dir_processados / f"{split_nome}_processos.jsonl"
+        if not arq_processos.is_file():
+            arq_processos = dir_processados / f"{nome_pt}_processos.jsonl"
+
         arq_chunks = dir_processados / f"{split_nome}_corpus_chunks.jsonl"
+        if not arq_chunks.is_file():
+            arq_chunks = dir_processados / f"{nome_pt}_corpus_chunks.jsonl"
 
         if not arq_processos.is_file() or not arq_chunks.is_file():
             log.warning("Arquivos para o split '%s' nao encontrados em %s. Pulando...", split_nome, dir_processados)
