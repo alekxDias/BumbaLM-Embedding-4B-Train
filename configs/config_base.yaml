@@ -7,10 +7,34 @@ projeto:
   seed: 42
 
 # Caminhos dos Dados
-# Edite 'caminho_dados_brutos' manualmente apontando para o .jsonl
 dados:
-  caminho_dados_brutos: ""
+  diretorio_base_pares: "Pares_Tribunais"
   diretorio_processados: "data/processed"
+  
+  # Lista explicita dos arquivos de pares para processamento.
+  # Comente ou descomente as linhas para incluir ou excluir tribunais:
+  arquivos_pares:
+    # --- TRIBUNAIS DE JUSTICA ESTADUAIS (ATIVOS PARA O PRIMEIRO TESTE) ---
+    - "pares_tjba.jsonl"
+    - "pares_tjdf.jsonl"
+    - "pares_tjes.jsonl"
+    - "pares_tjma.jsonl"
+    - "pares_tjms.jsonl"
+    - "pares_tjpa.jsonl"
+    - "pares_tjpb.jsonl"
+    - "pares_tjpr.jsonl"
+    - "pares_tjrn.jsonl"
+    - "pares_tjro.jsonl"
+    - "pares_tjrr.jsonl"
+    - "pares_tjrs.jsonl"
+
+    # --- TRIBUNAIS SUPERIORES E ESPECIALIZADOS (DESATIVADOS NESTE TESTE) ---
+    # - "pares_stf.jsonl"
+    # - "pares_tst.jsonl"
+    # - "pares_tse.jsonl"
+    # - "pares_stm.jsonl"
+    # - "pares_tcu.jsonl"
+    # - "pares_cnj.jsonl"
   
   # Mapeamento flexivel de nomes de colunas do arquivo bruto
   colunas:

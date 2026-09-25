@@ -68,13 +68,19 @@ def parse_args() -> argparse.Namespace:
         "--input",
         type=Path,
         default=None,
-        help="Sobrescreve o caminho do arquivo de dados brutos configurado no YAML.",
+        help="Sobrescreve a entrada de dados (arquivo unico, diretorio ou lista).",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
         default=None,
         help="Sobrescreve o diretorio de saida para dados processados.",
+    )
+    parser.add_argument(
+        "--max_por_tribunal",
+        type=int,
+        default=0,
+        help="Limite maximo de registros validos por tribunal (0 = todos; > 0 para teste rapido).",
     )
     return parser.parse_args()
 
@@ -85,12 +91,36 @@ def main() -> None:
     cfg_base = carregar_yaml(args.config_base)
     cfg_data = carregar_yaml(args.config_data)
 
-    # Extrai caminhos com suporte a override via CLI
     dados_cfg = cfg_base.get("dados", {})
-    caminho_bruto_str = str(args.input) if args.input else dados_cfg.get("caminho_dados_brutos", "data/raw/acordaos_multitribunais.jsonl")
-    caminho_bruto = Path(caminho_bruto_str)
-    if not caminho_bruto.is_absolute():
-        caminho_bruto = BASE_DIR / caminho_bruto
+
+    # Resolucao dos caminhos de entrada
+    caminhos_entrada: list[Path] = []
+    if args.input:
+        caminho_in = Path(args.input)
+        if not caminho_in.is_absolute():
+            caminho_in = BASE_DIR / caminho_in
+        if caminho_in.is_dir():
+            caminhos_entrada = sorted(list(caminho_in.glob("pares_*.jsonl")))
+        else:
+            caminhos_entrada = [caminho_in]
+    else:
+        dir_base = Path(dados_cfg.get("diretorio_base_pares", "Pares_Tribunais"))
+        if not dir_base.is_absolute():
+            dir_base = BASE_DIR / dir_base
+
+        arquivos_config = dados_cfg.get("arquivos_pares", [])
+        if arquivos_config:
+            for arq_nome in arquivos_config:
+                p = Path(arq_nome)
+                if not p.is_absolute():
+                    p = dir_base / p
+                caminhos_entrada.append(p)
+        else:
+            caminho_bruto_str = dados_cfg.get("caminho_dados_brutos", "data/raw/acordaos_multitribunais.jsonl")
+            caminho_bruto = Path(caminho_bruto_str)
+            if not caminho_bruto.is_absolute():
+                caminho_bruto = BASE_DIR / caminho_bruto
+            caminhos_entrada = [caminho_bruto]
 
     dir_processados_str = str(args.output_dir) if args.output_dir else dados_cfg.get("diretorio_processados", "data/processed")
     dir_processados = Path(dir_processados_str)
@@ -117,27 +147,33 @@ def main() -> None:
     test_ratio = divisao_cfg.get("test_ratio", 0.10)
     seed = cfg_base.get("projeto", {}).get("seed", 42)
 
+    modo_amostragem = f"Amostragem de teste ({args.max_por_tribunal} por tribunal)" if args.max_por_tribunal > 0 else "Completo (100% dos registros)"
+
     print("=" * 64)
     print("BumbaLM - Etapa 1: Preparacao, Filtragem e Divisao de Dados")
     print("=" * 64)
-    print(f"Arquivo de Entrada  : {caminho_bruto}")
-    print(f"Pasta de Destino    : {dir_processados}")
-    print(f"Proporcoes Split    : Treino={train_ratio:.0%} | Val={val_ratio:.0%} | Teste={test_ratio:.0%}")
-    print(f"Semente Aleatoria   : {seed}")
+    print(f"Arquivos Selecionados : {len(caminhos_entrada)}")
+    for c in caminhos_entrada:
+        print(f"  - {c.name}")
+    print(f"Pasta de Destino      : {dir_processados}")
+    print(f"Modo de Operacao      : {modo_amostragem}")
+    print(f"Proporcoes Split      : Treino={train_ratio:.0%} | Val={val_ratio:.0%} | Teste={test_ratio:.0%}")
+    print(f"Semente Aleatoria     : {seed}")
     print("-" * 64)
 
     # 1. Carregamento e filtragem de qualidade
     print("Lendo e filtrando registros brutos...")
     processos_validos, stats_filtro = carregar_e_filtrar_processos(
-        caminho_arquivo=caminho_bruto,
+        caminho_arquivo=caminhos_entrada,
         mapeamento_colunas=mapeamento_colunas,
         min_caracteres_ementa=min_ementa,
         min_caracteres_teor=min_teor,
         descartar_teor_menor_que_ementa=descartar_teor_menor,
         remover_html=remover_html,
+        max_por_tribunal=args.max_por_tribunal,
     )
 
-    print(f"Total lido          : {stats_filtro['total_lido']:,}")
+    print(f"Total lido            : {stats_filtro['total_lido']:,}")
     print(f"Processos validos   : {stats_filtro['validos']:,}")
     print(f"Descartados         : {stats_filtro['descartados']:,}")
     for motivo, qtd in sorted(stats_filtro["motivos_descarte"].items()):
@@ -182,7 +218,10 @@ def main() -> None:
         f.write("=" * 64 + "\n")
         f.write("RELATORIO DE PREPARACAO E DIVISAO DE DADOS - BUMBALM\n")
         f.write("=" * 64 + "\n\n")
-        f.write(f"Arquivo de Origem : {caminho_bruto}\n")
+        f.write("Arquivos de Origem:\n")
+        for c in caminhos_entrada:
+            f.write(f"  - {c.name}\n")
+        f.write(f"Modo de Amostragem: {modo_amostragem}\n")
         f.write(f"Total Lido        : {stats_filtro['total_lido']:,}\n")
         f.write(f"Validos           : {stats_filtro['validos']:,}\n")
         f.write(f"Descartados       : {stats_filtro['descartados']:,}\n\n")

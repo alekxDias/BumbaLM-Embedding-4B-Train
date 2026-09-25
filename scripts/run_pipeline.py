@@ -111,6 +111,17 @@ def parse_args() -> argparse.Namespace:
         default="test",
         help="Particao a ser avaliada na etapa eval (padrao: test).",
     )
+    parser.add_argument(
+        "--max_por_tribunal",
+        type=int,
+        default=None,
+        help="Limita o numero de registros por tribunal na etapa split (ex: 500 para teste).",
+    )
+    parser.add_argument(
+        "--smoke_test",
+        action="store_true",
+        help="Modo de execucao rapida ponta a ponta (500 reg/tribunal, batch menor) para validar o pipeline.",
+    )
     return parser.parse_args()
 
 
@@ -140,9 +151,22 @@ def executar_comando(comando: list[str], nome_etapa: str) -> bool:
 def main() -> None:
     args = parse_args()
 
+    if args.smoke_test:
+        if not args.steps:
+            args.all = True
+        if args.max_por_tribunal is None:
+            args.max_por_tribunal = 500
+        if args.epochs is None:
+            args.epochs = 1
+        print("=" * 64)
+        print("MODO SMOKE TEST ATIVADO: Execucao rapida para validacao do pipeline.")
+        print(f"Max reg/tribunal: {args.max_por_tribunal} | Hiperparametros: Originais do config_train.yaml")
+        print("=" * 64)
+
     if not args.all and not args.steps:
         print("\nErro: Nenhuma etapa foi selecionada para execucao.")
         print("\nExemplos rapidos:")
+        print("  - Teste rapido ponta a ponta: python scripts/run_pipeline.py --smoke_test")
         print("  - Executar todo o pipeline : python scripts/run_pipeline.py --all")
         print("  - Preparar dados e chunks  : python scripts/run_pipeline.py --steps split,chunk")
         print("  - Treinar e avaliar        : python scripts/run_pipeline.py --steps train,eval --compare_baseline")
@@ -174,8 +198,11 @@ def main() -> None:
         script_path = str(ETAPAS_DISPONIVEIS[etapa])
         cmd = [python_bin, script_path]
 
-        if etapa == "split" and args.input:
-            cmd.extend(["--input", str(args.input)])
+        if etapa == "split":
+            if args.input:
+                cmd.extend(["--input", str(args.input)])
+            if args.max_por_tribunal:
+                cmd.extend(["--max_por_tribunal", str(args.max_por_tribunal)])
 
         if etapa == "mine" and args.batch_size:
             cmd.extend(["--batch_size", str(args.batch_size)])
