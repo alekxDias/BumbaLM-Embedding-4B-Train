@@ -75,7 +75,7 @@ _RE_KERNING_VOGAL_FINAL = re.compile(r"\b([a-zA-Zá-úÁ-Úà-ùÀ-Ùâ-ûÂ-Û�
 _RE_KERNING_SUFIXO_MENTO = re.compile(r"\b([a-zA-Zá-úÁ-Úà-ùÀ-Ùâ-ûÂ-Ûã-õÃ-ÕçÇ]{4,}amen)\s+to\b")
 _RE_KERNING_SUFIXO_MENTE = re.compile(r"\b([a-zA-Zá-úÁ-Úà-ùÀ-Ùâ-ûÂ-Ûã-õÃ-ÕçÇ]{4,}(?:tiv|tiva|ria|iva|ica|al|el|il))\s+mente\b")
 _RE_KERNING_TERMOS_COMUNS = re.compile(r"\b(insufici[eê]n)\s+ci\s+a\b")
-_RE_REDIMENSIONA = re.compile(r"\b(redimensio)\s+na\s+(mento)\b")
+_RE_KERNING_REDIMENSIONA = re.compile(r"\b(redimensio)\s+na\s+(mento)\b")
 
 # Deteccao de Corrupcao de OCR e Fontes de PDF (glifos CID, /0/1, codigos brutos)
 _RE_LETRAS = re.compile(r"[a-zA-Zá-úÁ-Úà-ùÀ-Ùâ-ûÂ-Ûã-õÃ-ÕçÇ]")
