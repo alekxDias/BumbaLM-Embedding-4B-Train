@@ -93,6 +93,13 @@ def main() -> None:
 
     dados_cfg = cfg_base.get("dados", {})
 
+    TRIBUNAIS_ESTADUAIS_PADRAO = [
+        "pares_tjba.jsonl", "pares_tjdf.jsonl", "pares_tjes.jsonl",
+        "pares_tjma.jsonl", "pares_tjms.jsonl", "pares_tjpa.jsonl",
+        "pares_tjpb.jsonl", "pares_tjpr.jsonl", "pares_tjrn.jsonl",
+        "pares_tjro.jsonl", "pares_tjrr.jsonl", "pares_tjrs.jsonl",
+    ]
+
     # Resolucao dos caminhos de entrada
     caminhos_entrada: list[Path] = []
     if args.input:
@@ -104,12 +111,34 @@ def main() -> None:
         else:
             caminhos_entrada = [caminho_in]
     else:
-        dir_base = Path(dados_cfg.get("diretorio_base_pares", "/home/fabio.lobato/bumbalm/Pares_Tribunais"))
+        dir_base_str = dados_cfg.get("diretorio_base_pares", "/home/fabio.lobato/bumbalm/Pares_Tribunais")
+        dir_base = Path(dir_base_str)
+        if not dir_base.is_dir():
+            if (BASE_DIR.parent / "Pares_Tribunais").is_dir():
+                dir_base = BASE_DIR.parent / "Pares_Tribunais"
+            elif (BASE_DIR / "Pares_Tribunais").is_dir():
+                dir_base = BASE_DIR / "Pares_Tribunais"
+
         arquivos_config = dados_cfg.get("arquivos_pares", [])
+        if not arquivos_config:
+            # Fallback seguro: se nao configurado no YAML, usa os 12 estaduais
+            arquivos_config = TRIBUNAIS_ESTADUAIS_PADRAO
 
         for arq_nome in arquivos_config:
             p = Path(arq_nome)
-            caminhos_entrada.append(p if p.is_absolute() else dir_base / p)
+            caminho_completo = p if p.is_absolute() else dir_base / p
+            if caminho_completo.is_file():
+                caminhos_entrada.append(caminho_completo)
+            else:
+                print(f"[AVISO] Arquivo nao encontrado no disco: {caminho_completo}")
+
+    if not caminhos_entrada:
+        raise FileNotFoundError(
+            f"\n[ERRO CRITICO] Nenhum arquivo .jsonl encontrado para processar!\n"
+            f"Diretorio base verificado: {dir_base}\n"
+            f"Arquivos procurados      : {arquivos_config}\n"
+            f"Verifique se a pasta Pares_Tribunais contem os arquivos .jsonl."
+        )
 
     dir_processados_str = str(args.output_dir) if args.output_dir else dados_cfg.get("diretorio_processados", "data/processed")
     dir_processados = Path(dir_processados_str)
