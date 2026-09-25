@@ -104,11 +104,30 @@ def main() -> None:
         else:
             caminhos_entrada = [caminho_in]
     else:
-        dir_base = Path(dados_cfg.get("diretorio_base_pares", "Pares_Tribunais"))
-        if not dir_base.is_absolute():
-            dir_base = BASE_DIR / dir_base
+        dir_base_str = dados_cfg.get("diretorio_base_pares", "Pares_Tribunais")
+        dir_base = Path(dir_base_str)
+        if not dir_base.is_dir():
+            if (BASE_DIR / dir_base_str).is_dir():
+                dir_base = BASE_DIR / dir_base_str
+            elif (BASE_DIR.parent / dir_base_str).is_dir():
+                dir_base = BASE_DIR.parent / dir_base_str
+            elif Path(f"/home/fabio.lobato/bumbalm/{dir_base_str}").is_dir():
+                dir_base = Path(f"/home/fabio.lobato/bumbalm/{dir_base_str}")
+            elif Path("/home/fabio.lobato/bumbalm/Pares_Tribunais").is_dir():
+                dir_base = Path("/home/fabio.lobato/bumbalm/Pares_Tribunais")
+            else:
+                dir_base = BASE_DIR / dir_base_str
 
         arquivos_config = dados_cfg.get("arquivos_pares", [])
+        if not arquivos_config and dir_base.is_dir():
+            # Se nao configurado explicitamente no YAML, usa os 12 estaduais por padrao
+            arquivos_config = [
+                "pares_tjba.jsonl", "pares_tjdf.jsonl", "pares_tjes.jsonl",
+                "pares_tjma.jsonl", "pares_tjms.jsonl", "pares_tjpa.jsonl",
+                "pares_tjpb.jsonl", "pares_tjpr.jsonl", "pares_tjrn.jsonl",
+                "pares_tjro.jsonl", "pares_tjrr.jsonl", "pares_tjrs.jsonl",
+            ]
+
         if arquivos_config:
             for arq_nome in arquivos_config:
                 p = Path(arq_nome)

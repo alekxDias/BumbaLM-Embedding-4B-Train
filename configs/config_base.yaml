@@ -8,7 +8,7 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  diretorio_base_pares: "Pares_Tribunais"
+  diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
   diretorio_processados: "data/processed"
   
   # Lista explicita dos arquivos de pares para processamento.
@@ -47,4 +47,4 @@ dados:
 saidas:
   diretorio_experimentos: "experiments"
   nome_experimento: "exp_001_h200_4b"
-  hf_cache_dir: "cache/huggingface"
+  hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"
