@@ -97,6 +97,8 @@ def configurar_treinador(
     dataloader_pin_memory: bool = True,
     scale: float = 50.0,
     evaluator: Optional[Any] = None,
+    metric_for_best_model: str = "val_cosine_ndcg@10",
+    greater_is_better: bool = True,
 ) -> tuple[SentenceTransformerTrainer, ScientificMetricsCallback]:
     """
     Instancia a CachedMultipleNegativesRankingLoss e configura o SentenceTransformerTrainer
@@ -117,6 +119,15 @@ def configurar_treinador(
     total_steps = passos_por_epoca * num_epochs
     warmup_steps = int(total_steps * warmup_ratio)
 
+    tem_avaliador = evaluator is not None
+
+    # Ajuste dinamico de steps se o total_steps for menor que eval_steps
+    eval_steps_efetivo = eval_steps
+    save_steps_efetivo = save_steps
+    if tem_avaliador and total_steps < eval_steps:
+        eval_steps_efetivo = max(5, total_steps // 2)
+        save_steps_efetivo = eval_steps_efetivo
+
     print("Configuracao do Treinamento:")
     print(f"  - Batch Size Real          : {batch_size}")
     print(f"  - Mini Batch Size (Loss)   : {mini_batch_size}")
@@ -125,8 +136,11 @@ def configurar_treinador(
     print(f"  - Taxa de Aprendizado (LR) : {learning_rate}")
     print(f"  - Precisao bfloat16        : {bf16}")
     print(f"  - Dataloader Workers       : {dataloader_num_workers} | Pin Memory: {dataloader_pin_memory}")
-
-    tem_avaliador = evaluator is not None
+    if tem_avaliador:
+        print(f"  - Avaliador de Validacao   : Ativado (a cada {eval_steps_efetivo} steps)")
+        print(f"  - Metrica de Selecao       : {metric_for_best_model} (load_best_model_at_end=True)")
+    else:
+        print(f"  - Avaliador de Validacao   : Desativado (load_best_model_at_end=False)")
 
     # 3. Argumentos do Trainer
     training_args = SentenceTransformerTrainingArguments(
@@ -141,13 +155,13 @@ def configurar_treinador(
         bf16=bf16 and torch.cuda.is_available(),
         fp16=False,
         eval_strategy="steps" if tem_avaliador else "no",
-        eval_steps=eval_steps if tem_avaliador else None,
+        eval_steps=eval_steps_efetivo if tem_avaliador else None,
         save_strategy="steps",
-        save_steps=save_steps,
+        save_steps=save_steps_efetivo,
         save_total_limit=2,
         load_best_model_at_end=tem_avaliador,
-        metric_for_best_model="cosine_ndcg@10" if tem_avaliador else None,
-        greater_is_better=True if tem_avaliador else None,
+        metric_for_best_model=metric_for_best_model if tem_avaliador else None,
+        greater_is_better=greater_is_better if tem_avaliador else None,
         logging_steps=10,
         report_to="none",
         dataloader_num_workers=dataloader_num_workers,

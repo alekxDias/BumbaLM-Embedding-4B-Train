@@ -161,9 +161,9 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_id_tokenizer, trust_remote_code=True)
 
     arquivos_splits = {
-        "treino": dir_processados / "train_processos.jsonl",
-        "validacao": dir_processados / "val_processos.jsonl",
-        "teste": dir_processados / "test_processos.jsonl",
+        "train": dir_processados / "train_processos.jsonl",
+        "val": dir_processados / "val_processos.jsonl",
+        "test": dir_processados / "test_processos.jsonl",
     }
 
     relatorios_splits = {}

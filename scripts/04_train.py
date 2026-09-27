@@ -34,6 +34,7 @@ import torch
 
 from src.training.model_builder import construir_modelo_embedding
 from src.training.trainer import carregar_dataset_tripletos, configurar_treinador
+from src.evaluation.ir_evaluator import criar_ir_evaluator
 
 
 def carregar_yaml(caminho: Path) -> dict[str, Any]:
@@ -100,6 +101,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Sobrescreve o mini_batch_size para o GradCache (CachedMNRL).",
+    )
+    parser.add_argument(
+        "--no_eval",
+        action="store_true",
+        help="Desativa o InformationRetrievalEvaluator durante o treinamento.",
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help="Sobrescreve a frequencia de avaliacao intermediaria (eval_steps).",
     )
     return parser.parse_args()
 
@@ -187,7 +199,38 @@ def main() -> None:
         query_instruction=query_instruction,
     )
 
-    # 3. Configuracao do Trainer e Telemetria
+    # 3. Construcao do Avaliador de Validacao (InformationRetrievalEvaluator)
+    evaluator = None
+    if not args.no_eval:
+        arq_val_processos = dir_processados / "val_processos.jsonl"
+        arq_val_chunks = dir_processados / "val_corpus_chunks.jsonl"
+        if not arq_val_chunks.is_file():
+            arq_val_chunks = dir_processados / "validacao_corpus_chunks.jsonl"
+
+        if arq_val_processos.is_file() and arq_val_chunks.is_file():
+            eval_batch_size = cfg_train.get("avaliacao", {}).get("eval_batch_size", 128)
+            print("Configurando InformationRetrievalEvaluator sobre o split de validacao...")
+            evaluator = criar_ir_evaluator(
+                caminho_processos=arq_val_processos,
+                caminho_chunks=arq_val_chunks,
+                nome="val",
+                query_instruction=query_instruction,
+                excluir_chunks_contaminados=True,
+                batch_size=eval_batch_size,
+                show_progress_bar=False,
+            )
+            print("  - Avaliador de validacao pronto (chunks com vazamento de ementa excluidos).")
+        else:
+            print("Aviso: Arquivos de validacao nao encontrados. O treinamento continuara sem avaliacao intermediaria.")
+    else:
+        print("Flag --no_eval detectada: Avaliacao intermediaria desativada.")
+
+    # 4. Configuracao do Trainer e Telemetria
+    metric_best = cfg_train.get("metric_for_best_model", "val_cosine_ndcg@10")
+    greater_is_better = cfg_train.get("greater_is_better", True)
+    if args.eval_steps is not None:
+        eval_steps = args.eval_steps
+
     trainer, telemetry = configurar_treinador(
         model=model,
         train_dataset=train_dataset,
@@ -205,7 +248,9 @@ def main() -> None:
         dataloader_num_workers=num_workers,
         dataloader_pin_memory=pin_memory,
         scale=loss_scale,
-        evaluator=None,
+        evaluator=evaluator,
+        metric_for_best_model=metric_best,
+        greater_is_better=greater_is_better,
     )
 
     # 4. Execucao do Fine-Tuning

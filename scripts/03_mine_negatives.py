@@ -3,7 +3,7 @@
 Pipeline BumbaLM - Etapa 3: Mineracao de Hard Negatives em GPU para o Treinamento.
 
 Executa:
-1. Leitura dos processos de treino ('train_processos.jsonl') e dos chunks ('treino_corpus_chunks.jsonl').
+1. Leitura dos processos de treino ('train_processos.jsonl') e dos chunks ('train_corpus_chunks.jsonl').
 2. Inicializacao do modelo base para inferencia vetorial acelerada (Qwen3).
 3. Geracao de embeddings normalizados para todo o corpus de chunks do treino.
 4. Comparacao matricial em GPU e selecao de 5 hard negatives por positivo (na faixa [0.60, 0.85]).
@@ -159,9 +159,9 @@ def main() -> None:
         arq_processos = dir_processados / "treino_processos.jsonl"
 
     # Localiza arquivo de chunks de treino
-    arq_chunks = dir_processados / "treino_corpus_chunks.jsonl"
+    arq_chunks = dir_processados / "train_corpus_chunks.jsonl"
     if not arq_chunks.is_file():
-        arq_chunks = dir_processados / "train_corpus_chunks.jsonl"
+        arq_chunks = dir_processados / "treino_corpus_chunks.jsonl"
 
     # Arquivo de tripletos final de saida
     arq_saida = args.output_file or (dir_processados / "train_triplets.jsonl")

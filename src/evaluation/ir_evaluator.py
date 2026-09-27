@@ -149,7 +149,7 @@ def montar_estruturas_ir(
 def criar_ir_evaluator(
     caminho_processos: Path | str,
     caminho_chunks: Path | str,
-    nome: str = "juridico_in_domain",
+    nome: str = "juridico",
     query_instruction: str = "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: ",
     excluir_chunks_contaminados: bool = True,
     limite_queries: Optional[int] = None,
