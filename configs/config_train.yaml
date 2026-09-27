@@ -11,9 +11,9 @@ modelo:
   attn_implementation: "sdpa"
 
 treinamento:
-  # Lotes reais para explorar os 141 GB de VRAM e maximizar negativos in-batch
-  batch_size_train: 96
-  mini_batch_size: 96
+  # Lotes reais com GradCache otimizados para GPU
+  batch_size_train: 64
+  mini_batch_size: 32
   gradient_accumulation_steps: 1
   
   # Otimizacao de memoria e velocidade

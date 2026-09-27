@@ -17,8 +17,10 @@ Uso:
 
 from __future__ import annotations
 
-import argparse
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import argparse
 import random
 import sys
 from pathlib import Path
@@ -93,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Sobrescreve a taxa de aprendizado (learning_rate).",
     )
+    parser.add_argument(
+        "--mini_batch_size",
+        type=int,
+        default=None,
+        help="Sobrescreve o mini_batch_size para o GradCache (CachedMNRL).",
+    )
     return parser.parse_args()
 
 
@@ -137,8 +145,8 @@ def main() -> None:
 
     # Parametros de treino
     train_cfg = cfg_train.get("treinamento", {})
-    batch_size = args.batch_size or train_cfg.get("batch_size_train", 96)
-    mini_batch_size = train_cfg.get("mini_batch_size", batch_size)
+    batch_size = args.batch_size or train_cfg.get("batch_size_train", 64)
+    mini_batch_size = args.mini_batch_size or train_cfg.get("mini_batch_size", 32)
     grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
     lr = args.lr or train_cfg.get("learning_rate", 2.0e-5)
     weight_decay = train_cfg.get("weight_decay", 0.01)

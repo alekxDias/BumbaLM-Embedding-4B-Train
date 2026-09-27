@@ -88,6 +88,12 @@ def parse_args() -> argparse.Namespace:
         help="Sobrescreve o batch size para treino ou inferencia.",
     )
     parser.add_argument(
+        "--mini_batch_size",
+        type=int,
+        default=None,
+        help="Sobrescreve o mini_batch_size do GradCache para a etapa train.",
+    )
+    parser.add_argument(
         "--epochs",
         type=int,
         default=None,
@@ -210,6 +216,8 @@ def main() -> None:
         if etapa == "train":
             if args.batch_size:
                 cmd.extend(["--batch_size", str(args.batch_size)])
+            if args.mini_batch_size:
+                cmd.extend(["--mini_batch_size", str(args.mini_batch_size)])
             if args.epochs:
                 cmd.extend(["--epochs", str(args.epochs)])
             if args.lr:
