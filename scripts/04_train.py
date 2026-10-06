@@ -113,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Sobrescreve a frequencia de avaliacao intermediaria (eval_steps).",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Caminho do checkpoint ou 'auto' para retomar o treinamento a partir do mais recente.",
+    )
     return parser.parse_args()
 
 
@@ -166,8 +172,8 @@ def main() -> None:
     warmup_ratio = train_cfg.get("warmup_ratio", 0.05)
     bf16 = train_cfg.get("bf16", True)
     grad_checkpointing = train_cfg.get("gradient_checkpointing", False)
-    num_workers = train_cfg.get("dataloader_num_workers", 8)
-    pin_memory = train_cfg.get("dataloader_pin_memory", True)
+    num_workers = train_cfg.get("dataloader_num_workers", 4)
+    pin_memory = train_cfg.get("dataloader_pin_memory", False)
     eval_steps = train_cfg.get("eval_steps", 250)
     save_steps = train_cfg.get("save_steps", 250)
     loss_scale = cfg_train.get("loss", {}).get("scale", 50.0)
@@ -254,9 +260,25 @@ def main() -> None:
     )
 
     # 4. Execucao do Fine-Tuning
+    resume = args.resume_from_checkpoint
+    if resume is not None:
+        if str(resume).strip().lower() in ("true", "auto", "1"):
+            resume = True
+        else:
+            p_resume = Path(resume)
+            if not p_resume.is_absolute():
+                if (dir_saida / p_resume).exists():
+                    p_resume = dir_saida / p_resume
+                elif (BASE_DIR / p_resume).exists():
+                    p_resume = BASE_DIR / p_resume
+            resume = str(p_resume)
+
     print("-" * 64)
-    print("Disparando treinamento contrastivo com telemetria cientifica...")
-    trainer.train()
+    if resume:
+        print(f"Retomando treinamento a partir do checkpoint: {resume}")
+    else:
+        print("Disparando treinamento contrastivo com telemetria cientifica...")
+    trainer.train(resume_from_checkpoint=resume)
 
     # 5. Salvamento do Modelo Final
     best_model_path = dir_saida / "best_model_4b"

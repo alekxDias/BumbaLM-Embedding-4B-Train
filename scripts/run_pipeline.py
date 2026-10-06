@@ -128,6 +128,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Modo de execucao rapida ponta a ponta (500 reg/tribunal, batch menor) para validar o pipeline.",
     )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="Retoma treinamento a partir de checkpoint ('auto' ou caminho).",
+    )
     return parser.parse_args()
 
 
@@ -222,6 +228,8 @@ def main() -> None:
                 cmd.extend(["--epochs", str(args.epochs)])
             if args.lr:
                 cmd.extend(["--lr", str(args.lr)])
+            if args.resume_from_checkpoint:
+                cmd.extend(["--resume_from_checkpoint", str(args.resume_from_checkpoint)])
 
         if etapa == "eval":
             cmd.extend(["--split", args.eval_split])

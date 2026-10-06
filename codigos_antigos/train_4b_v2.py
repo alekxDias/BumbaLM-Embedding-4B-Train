@@ -19,9 +19,9 @@ Principais Otimizacoes Aplicadas em Relacao a Versao Baseline:
      ativacoes no backward. O treinamento torna-se de 30% a 40% mais veloz por step.
 4. Kernels de Atencao Otimizados (ATTN_IMPLEMENTATION = 'sdpa' ou 'flash_attention_2'):
    - Evita a materializacao O(n^2) da atencao eager, explorando os Tensor Cores Hopper.
-5. Fim do Gargalo de I/O de CPU (GPU Starvation):
-   - dataloader_num_workers = 8 e pin_memory = True garantem que os lotes fiquem
-     pre-carregados na memoria do host para transferencia imediata via PCIe.
+5. Otimizacao de Memoria do Host (Prevencao de Host OOM):
+   - dataloader_num_workers = 4 e pin_memory = False previnem o esgotamento
+     de memoria RAM fisica ao longo de treinos longos de dezenas de horas.
 6. Avaliador IR Acelerado (batch size 128):
    - Reduz drasticamente o tempo gasto nas etapas intermediarias de validacao.
 
@@ -136,9 +136,9 @@ CFG = {
     "GRADIENT_CHECKPOINTING": False, # Desativado: utiliza a VRAM sobrando para acelerar o treino
     "SEED": 42,
 
-    # Otimizacao de I/O e Dataloader contra GPU Starvation
-    "DATALOADER_NUM_WORKERS": 8,     # Multiplas threads para tokenizacao e preparo de lote
-    "DATALOADER_PIN_MEMORY": True,   # Bloqueia memoria de pagina para transferencia rapida via PCIe
+    # Otimizacao de I/O e Dataloader contra Host OOM
+    "DATALOADER_NUM_WORKERS": 4,     # Threads equilibradas para preparo de lote sem sobrecarregar RAM
+    "DATALOADER_PIN_MEMORY": False,  # Desativado para evitar travamento de memoria fisica nao paginavel
     "EVAL_BATCH_SIZE": 128,          # Lote acelerado de inferencia no avaliador IR
 }
 

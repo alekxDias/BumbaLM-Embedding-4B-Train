@@ -20,9 +20,9 @@ treinamento:
   bf16: true
   gradient_checkpointing: false # Desativado: usa a VRAM extra
   
-  # Otimizacao de alimentacao CPU -> GPU (GPU Starvation)
-  dataloader_num_workers: 8
-  dataloader_pin_memory: true
+  # Otimizacao de alimentacao CPU -> GPU
+  dataloader_num_workers: 4
+  dataloader_pin_memory: false
   
   # Otimizador e escalonamento
   num_epochs: 1
