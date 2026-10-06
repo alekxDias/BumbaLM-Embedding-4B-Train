@@ -72,8 +72,10 @@ def carregar_dataset_tripletos(
     if validos == 0:
         raise ValueError(f"Nenhum tripleto valido com {n_negativos} negativos foi encontrado em {caminho}")
 
-    dataset = Dataset.from_dict(dados)
-    dataset = dataset.select_columns(colunas)
+    import pyarrow as pa
+    schema_large = pa.schema([pa.field(col, pa.large_string()) for col in colunas])
+    tabela_arrow = pa.Table.from_pydict(dados, schema=schema_large)
+    dataset = Dataset(tabela_arrow)
 
     print(f"Dataset de Treino Carregado: {validos:,} tripletos validos (descartados: {descartados:,})")
     return dataset
