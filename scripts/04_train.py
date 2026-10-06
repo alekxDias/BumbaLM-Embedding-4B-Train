@@ -38,6 +38,30 @@ import transformers.trainer as _tf_trainer
 _tf_import_utils.check_torch_load_is_safe = lambda: None
 _tf_trainer.check_torch_load_is_safe = lambda: None
 
+# Suporte para desserializacao segura de objetos NumPy (NumPy 2.0 / Python 3.13)
+try:
+    import numpy as np
+    safe_list = [np.ndarray, np.dtype]
+    if hasattr(np, "_core") and hasattr(np._core, "multiarray"):
+        if hasattr(np._core.multiarray, "_reconstruct"):
+            safe_list.append(np._core.multiarray._reconstruct)
+        if hasattr(np._core.multiarray, "scalar"):
+            safe_list.append(np._core.multiarray.scalar)
+    if hasattr(torch.serialization, "add_safe_globals"):
+        torch.serialization.add_safe_globals(safe_list)
+except Exception:
+    pass
+
+# Tratamento defensivo para rng_state: evita abortar o treino caso o pickle da semente aleatoria falhe
+if hasattr(_tf_trainer.Trainer, "_load_rng_state"):
+    _orig_load_rng_state = _tf_trainer.Trainer._load_rng_state
+    def _safe_load_rng_state(self, resume_from_checkpoint):
+        try:
+            _orig_load_rng_state(self, resume_from_checkpoint)
+        except Exception as exc:
+            print(f"[Aviso] Nao foi possivel restaurar rng_state ({exc}). O treinamento continuara com novo estado de RNG.")
+    _tf_trainer.Trainer._load_rng_state = _safe_load_rng_state
+
 from src.training.model_builder import construir_modelo_embedding
 from src.training.trainer import carregar_dataset_tripletos, configurar_treinador
 from src.evaluation.ir_evaluator import criar_ir_evaluator
