@@ -12,6 +12,8 @@ Executa:
 
 Uso:
     python scripts/04_train.py
+    python scripts/04_train.py --gpus 1
+    python scripts/04_train.py --gpus 0,1
     python scripts/04_train.py --batch_size 128 --epochs 1
 """
 
@@ -22,6 +24,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import random
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -77,6 +80,68 @@ def carregar_yaml(caminho: Path) -> dict[str, Any]:
             return yaml.safe_load(f) or {}
     except ImportError:
         return {}
+
+
+def _ids_gpus(texto: str) -> list[str]:
+    return [parte.strip() for parte in str(texto or "").split(",") if parte.strip()]
+
+
+def _ja_distribuido() -> bool:
+    return os.environ.get("LOCAL_RANK") is not None
+
+
+def _processo_principal() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _imprimir(mensagem: str) -> None:
+    if _processo_principal():
+        print(mensagem)
+
+
+def _resolver_gpus(args: argparse.Namespace, cfg_train: dict[str, Any]) -> str:
+    if args.gpus is not None:
+        return args.gpus.strip()
+    bruto = cfg_train.get("hardware", {}).get("gpus")
+    if bruto is None:
+        return ""
+    return str(bruto).strip()
+
+
+def _preparar_gpus(gpus: str) -> None:
+    """Fixa uma GPU ou relanca o script em DDP quando ha duas ou mais."""
+    if _ja_distribuido():
+        return
+
+    ids = _ids_gpus(gpus)
+    if not ids:
+        return
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(ids)
+    if len(ids) == 1:
+        return
+
+    comando = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node",
+        str(len(ids)),
+        str(Path(__file__).resolve()),
+        *sys.argv[1:],
+    ]
+    print(f"Relancando treino em {len(ids)} GPUs ({','.join(ids)}) com torch.distributed.run ...")
+    resultado = subprocess.run(comando)
+    sys.exit(resultado.returncode)
+
+
+def _dispositivo_local() -> str:
+    if not torch.cuda.is_available():
+        return "cpu"
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    return f"cuda:{local_rank}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +214,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Caminho do checkpoint ou 'auto' para retomar o treinamento a partir do mais recente.",
     )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="GPUs a usar, separadas por virgula. Ex.: '1' ou '0,1'. Vazio mantem o processo unico atual.",
+    )
     return parser.parse_args()
 
 
@@ -157,6 +228,7 @@ def main() -> None:
 
     cfg_base = carregar_yaml(args.config_base)
     cfg_train = carregar_yaml(args.config_train)
+    _preparar_gpus(_resolver_gpus(args, cfg_train))
 
     seed = cfg_base.get("projeto", {}).get("seed", 42)
     random.seed(seed)
@@ -208,17 +280,21 @@ def main() -> None:
     save_steps = train_cfg.get("save_steps", 250)
     loss_scale = cfg_train.get("loss", {}).get("scale", 50.0)
 
-    print("=" * 64)
-    print("BumbaLM - Etapa 4: Treinamento Contrastivo em GPU H200")
-    print("=" * 64)
-    print(f"Arquivo de Tripletos : {caminho_tripletos}")
-    print(f"Diretorio de Saida   : {dir_saida}")
-    print(f"Modelo de Base       : {model_id}")
-    print(f"Batch Size Real      : {batch_size} (Acumulacao: {grad_accum})")
-    print(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
-    print(f"Precisao bfloat16    : {bf16} | Atencao: {attn_impl}")
-    print(f"Dataloader Workers   : {num_workers} | Pin Memory: {pin_memory}")
-    print("-" * 64)
+    dispositivo = _dispositivo_local()
+    num_processos = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+
+    _imprimir("=" * 64)
+    _imprimir("BumbaLM - Etapa 4: Treinamento Contrastivo em GPU H200")
+    _imprimir("=" * 64)
+    _imprimir(f"Arquivo de Tripletos : {caminho_tripletos}")
+    _imprimir(f"Diretorio de Saida   : {dir_saida}")
+    _imprimir(f"Modelo de Base       : {model_id}")
+    _imprimir(f"GPUs no passo        : {num_processos} | Dispositivo local: {dispositivo}")
+    _imprimir(f"Batch por GPU        : {batch_size} (Acumulacao: {grad_accum})")
+    _imprimir(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
+    _imprimir(f"Precisao bfloat16    : {bf16} | Atencao: {attn_impl}")
+    _imprimir(f"Dataloader Workers   : {num_workers} | Pin Memory: {pin_memory}")
+    _imprimir("-" * 64)
 
     # 1. Construcao do Modelo de Embedding
     model = construir_modelo_embedding(
@@ -226,6 +302,7 @@ def main() -> None:
         max_seq_length=max_seq_len,
         attn_implementation=attn_impl,
         gradient_checkpointing=grad_checkpointing,
+        device=dispositivo,
     )
 
     # 2. Carregamento do Dataset de Tripletos
@@ -245,7 +322,7 @@ def main() -> None:
 
         if arq_val_processos.is_file() and arq_val_chunks.is_file():
             eval_batch_size = cfg_train.get("avaliacao", {}).get("eval_batch_size", 128)
-            print("Configurando InformationRetrievalEvaluator sobre o split de validacao...")
+            _imprimir("Configurando InformationRetrievalEvaluator sobre o split de validacao...")
             evaluator = criar_ir_evaluator(
                 caminho_processos=arq_val_processos,
                 caminho_chunks=arq_val_chunks,
@@ -255,11 +332,11 @@ def main() -> None:
                 batch_size=eval_batch_size,
                 show_progress_bar=False,
             )
-            print("  - Avaliador de validacao pronto (chunks com vazamento de ementa excluidos).")
+            _imprimir("  - Avaliador de validacao pronto (chunks com vazamento de ementa excluidos).")
         else:
-            print("Aviso: Arquivos de validacao nao encontrados. O treinamento continuara sem avaliacao intermediaria.")
+            _imprimir("Aviso: Arquivos de validacao nao encontrados. O treinamento continuara sem avaliacao intermediaria.")
     else:
-        print("Flag --no_eval detectada: Avaliacao intermediaria desativada.")
+        _imprimir("Flag --no_eval detectada: Avaliacao intermediaria desativada.")
 
     # 4. Configuracao do Trainer e Telemetria
     metric_best = cfg_train.get("metric_for_best_model", "val_cosine_ndcg@10")
@@ -303,23 +380,28 @@ def main() -> None:
                     p_resume = BASE_DIR / p_resume
             resume = str(p_resume)
 
-    print("-" * 64)
+    _imprimir("-" * 64)
     if resume:
-        print(f"Retomando treinamento a partir do checkpoint: {resume}")
+        _imprimir(f"Retomando treinamento a partir do checkpoint: {resume}")
     else:
-        print("Disparando treinamento contrastivo com telemetria cientifica...")
+        _imprimir("Disparando treinamento contrastivo com telemetria cientifica...")
     trainer.train(resume_from_checkpoint=resume)
 
-    # 5. Salvamento do Modelo Final
-    best_model_path = dir_saida / "best_model_4b"
-    model.save(str(best_model_path))
+    # 5. Salvamento do Modelo Final (somente o processo da primeira GPU)
+    if _processo_principal():
+        modelo_salvar = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
+        best_model_path = dir_saida / "best_model_4b"
+        modelo_salvar.save(str(best_model_path))
 
-    print("=" * 64)
-    print(f"Treinamento concluido com sucesso!")
-    print(f"Melhor modelo persistido em: {best_model_path}")
-    print(f"Relatorio executivo JSON   : {telemetry.json_path}")
-    print(f"Metricas tabulares CSV     : {telemetry.csv_path}")
-    print("=" * 64)
+        print("=" * 64)
+        print("Treinamento concluido com sucesso!")
+        print(f"Melhor modelo persistido em: {best_model_path}")
+        print(f"Relatorio executivo JSON   : {telemetry.json_path}")
+        print(f"Metricas tabulares CSV     : {telemetry.csv_path}")
+        print("=" * 64)
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
 
 if __name__ == "__main__":

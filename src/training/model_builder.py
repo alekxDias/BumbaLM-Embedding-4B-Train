@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 from typing import Optional
 
 import torch
@@ -34,7 +35,7 @@ def construir_modelo_embedding(
         attn_implementation: Mecanismo de atencao ('sdpa' ou 'flash_attention_2').
         gradient_checkpointing: Se True, economiza VRAM recalculando ativacoes no backward.
             Na GPU H200 (141 GB), manter False acelera o treino em ate 35%.
-        device: Dispositivo de execucao ('cuda' ou 'cpu').
+        device: Dispositivo de execucao ('cuda', 'cuda:0', 'cuda:1' ou 'cpu').
 
     Returns:
         Instancia de SentenceTransformer pronta para fine-tuning.
@@ -42,14 +43,21 @@ def construir_modelo_embedding(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dtype_modelo = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else (torch.float16 if device == "cuda" else torch.float32)
+    em_cuda = str(device).startswith("cuda")
+    if em_cuda and ":" in str(device):
+        torch.cuda.set_device(int(str(device).split(":", 1)[1]))
 
-    print(f"Construindo modelo base: {model_id} ...")
-    print(f"  - Dispositivo          : {device}")
-    print(f"  - Precisao             : {dtype_modelo}")
-    print(f"  - Comprimento Maximo   : {max_seq_length} tokens")
-    print(f"  - Atencao Otimizada    : {attn_implementation}")
-    print(f"  - Gradient Checkpoint  : {gradient_checkpointing}")
+    dtype_modelo = torch.bfloat16 if em_cuda and torch.cuda.is_bf16_supported() else (torch.float16 if em_cuda else torch.float32)
+
+    rank = os.environ.get("RANK", "0")
+    print(f"[rank {rank}] Construindo modelo em {device}", flush=True)
+    if rank == "0":
+        print(f"Construindo modelo base: {model_id} ...")
+        print(f"  - Dispositivo          : {device}")
+        print(f"  - Precisao             : {dtype_modelo}")
+        print(f"  - Comprimento Maximo   : {max_seq_length} tokens")
+        print(f"  - Atencao Otimizada    : {attn_implementation}")
+        print(f"  - Gradient Checkpoint  : {gradient_checkpointing}")
 
     gc.collect()
     if torch.cuda.is_available():
@@ -61,7 +69,7 @@ def construir_modelo_embedding(
         max_seq_length=max_seq_length,
         tokenizer_args={"padding_side": "left"},
         model_args={
-            "attn_implementation": attn_implementation if device == "cuda" else "eager",
+            "attn_implementation": attn_implementation if em_cuda else "eager",
             "torch_dtype": dtype_modelo,
             "trust_remote_code": True,
         },
@@ -69,12 +77,13 @@ def construir_modelo_embedding(
     word_embedding_model.auto_model.config.use_cache = False
 
     # 2. Ativacao ou desativacao do Gradient Checkpointing
-    if gradient_checkpointing and device == "cuda":
+    if gradient_checkpointing and em_cuda:
         word_embedding_model.auto_model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        print("  - Gradient Checkpointing ativado com sucesso.")
-    else:
+        if rank == "0":
+            print("  - Gradient Checkpointing ativado com sucesso.")
+    elif rank == "0":
         print("  - Gradient Checkpointing desativado (priorizando velocidade na H200).")
 
     # 3. Full Fine-Tuning: Habilita gradientes em 100% dos parametros do Transformer
@@ -100,6 +109,7 @@ def construir_modelo_embedding(
     trainable_params = sum(p.numel() for p in word_embedding_model.auto_model.parameters() if p.requires_grad)
     pct_treinavel = 100 * trainable_params / max(1, total_params)
 
-    print(f"Modelo estruturado com sucesso: {trainable_params:,} parametros treinaveis ({pct_treinavel:.1f}% - Full Fine-Tuning)")
+    if rank == "0":
+        print(f"Modelo estruturado com sucesso: {trainable_params:,} parametros treinaveis ({pct_treinavel:.1f}% - Full Fine-Tuning)")
 
     return modelo

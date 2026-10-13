@@ -4,8 +4,10 @@ Configuracao de dataset, funcao de perda (CachedMNRL) e SentenceTransformerTrain
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,6 +22,19 @@ from src.training.telemetry import ScientificMetricsCallback
 
 
 log = logging.getLogger("bumbalm_trainer")
+
+
+def _processo_principal() -> bool:
+    return int(os.environ.get("RANK", "0")) == 0
+
+
+def _imprimir(mensagem: str) -> None:
+    if _processo_principal():
+        print(mensagem)
+
+
+def _num_processos() -> int:
+    return max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
 
 def carregar_dataset_tripletos(
@@ -77,7 +92,7 @@ def carregar_dataset_tripletos(
     tabela_arrow = pa.Table.from_pydict(dados, schema=schema_large)
     dataset = Dataset(tabela_arrow)
 
-    print(f"Dataset de Treino Carregado: {validos:,} tripletos validos (descartados: {descartados:,})")
+    _imprimir(f"Dataset de Treino Carregado: {validos:,} tripletos validos (descartados: {descartados:,})")
     return dataset
 
 
@@ -109,15 +124,30 @@ def configurar_treinador(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    num_processos = _num_processos()
+    juntar_gpus = num_processos > 1
+
     # 1. Funcao de Perda Contrastiva (CachedMNRL)
-    loss = CachedMultipleNegativesRankingLoss(
-        model=model,
-        mini_batch_size=mini_batch_size,
-        scale=scale,
-    )
+    kwargs_loss: dict[str, Any] = {
+        "model": model,
+        "mini_batch_size": mini_batch_size,
+        "scale": scale,
+    }
+    if juntar_gpus:
+        parametros_loss = inspect.signature(CachedMultipleNegativesRankingLoss.__init__).parameters
+        if "gather_across_devices" in parametros_loss:
+            kwargs_loss["gather_across_devices"] = True
+        else:
+            juntar_gpus = False
+            _imprimir(
+                "Aviso: esta versao do Sentence Transformers nao aceita gather_across_devices. "
+                "Cada GPU usara apenas os negativos do proprio lote."
+            )
+    loss = CachedMultipleNegativesRankingLoss(**kwargs_loss)
 
     # 2. Calculo de steps e warmup
-    passos_por_epoca = max(1, len(train_dataset) // (batch_size * gradient_accumulation_steps))
+    lote_passo = batch_size * gradient_accumulation_steps * num_processos
+    passos_por_epoca = max(1, len(train_dataset) // lote_passo)
     total_steps = passos_por_epoca * num_epochs
     warmup_steps = int(total_steps * warmup_ratio)
 
@@ -130,19 +160,21 @@ def configurar_treinador(
         eval_steps_efetivo = max(5, total_steps // 2)
         save_steps_efetivo = eval_steps_efetivo
 
-    print("Configuracao do Treinamento:")
-    print(f"  - Batch Size Real          : {batch_size}")
-    print(f"  - Mini Batch Size (Loss)   : {mini_batch_size}")
-    print(f"  - Acumulacao de Gradientes : {gradient_accumulation_steps} (Batch efetivo: {batch_size * gradient_accumulation_steps})")
-    print(f"  - Total Steps Estimados    : {total_steps:,} | Warmup: {warmup_steps:,}")
-    print(f"  - Taxa de Aprendizado (LR) : {learning_rate}")
-    print(f"  - Precisao bfloat16        : {bf16}")
-    print(f"  - Dataloader Workers       : {dataloader_num_workers} | Pin Memory: {dataloader_pin_memory}")
+    _imprimir("Configuracao do Treinamento:")
+    _imprimir(f"  - Batch por GPU            : {batch_size}")
+    _imprimir(f"  - Processos (GPUs)         : {num_processos}")
+    _imprimir(f"  - Mini Batch Size (Loss)   : {mini_batch_size}")
+    _imprimir(f"  - Acumulacao de Gradientes : {gradient_accumulation_steps} (Batch do passo: {lote_passo})")
+    _imprimir(f"  - Negativos entre GPUs     : {juntar_gpus}")
+    _imprimir(f"  - Total Steps Estimados    : {total_steps:,} | Warmup: {warmup_steps:,}")
+    _imprimir(f"  - Taxa de Aprendizado (LR) : {learning_rate}")
+    _imprimir(f"  - Precisao bfloat16        : {bf16}")
+    _imprimir(f"  - Dataloader Workers       : {dataloader_num_workers} | Pin Memory: {dataloader_pin_memory}")
     if tem_avaliador:
-        print(f"  - Avaliador de Validacao   : Ativado (a cada {eval_steps_efetivo} steps)")
-        print(f"  - Metrica de Selecao       : {metric_for_best_model} (load_best_model_at_end=True)")
+        _imprimir(f"  - Avaliador de Validacao   : Ativado (a cada {eval_steps_efetivo} steps)")
+        _imprimir(f"  - Metrica de Selecao       : {metric_for_best_model} (load_best_model_at_end=True)")
     else:
-        print(f"  - Avaliador de Validacao   : Desativado (load_best_model_at_end=False)")
+        _imprimir("  - Avaliador de Validacao   : Desativado (load_best_model_at_end=False)")
 
     # 3. Argumentos do Trainer
     training_args = SentenceTransformerTrainingArguments(
@@ -178,14 +210,15 @@ def configurar_treinador(
         nome_modelo=model[0].auto_model.config.name_or_path if hasattr(model[0], "auto_model") else "Qwen3-4B",
     )
 
-    # 5. Trainer
+    # 5. Trainer. Telemetria e gravacao de metricas ficam no processo 0.
+    callbacks = [telemetry_callback] if _processo_principal() else []
     trainer = SentenceTransformerTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         loss=loss,
         evaluator=evaluator,
-        callbacks=[telemetry_callback],
+        callbacks=callbacks,
     )
 
     return trainer, telemetry_callback

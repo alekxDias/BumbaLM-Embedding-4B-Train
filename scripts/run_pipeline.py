@@ -30,6 +30,9 @@ Permite executar o pipeline completo de ponta a ponta ou etapas especificas:
 7. Apenas treinamento contrastivo com parametros customizados:
    python scripts/run_pipeline.py --steps train --batch_size 96 --epochs 2 --lr 1.5e-5
 
+7b. Treino nas duas GPUs (DDP, lote de 64 por placa):
+   python scripts/run_pipeline.py --steps train --gpus 0,1
+
 8. Apenas avaliacao do modelo salvo contra o modelo baseline zero-shot no conjunto de teste:
    python scripts/run_pipeline.py --steps eval --compare_baseline
 
@@ -134,6 +137,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Retoma treinamento a partir de checkpoint ('auto' ou caminho).",
     )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="GPUs da etapa train. Ex.: '1' ou '0,1'. Repassado ao script de treino.",
+    )
     return parser.parse_args()
 
 
@@ -230,6 +239,8 @@ def main() -> None:
                 cmd.extend(["--lr", str(args.lr)])
             if args.resume_from_checkpoint:
                 cmd.extend(["--resume_from_checkpoint", str(args.resume_from_checkpoint)])
+            if args.gpus:
+                cmd.extend(["--gpus", args.gpus])
 
         if etapa == "eval":
             cmd.extend(["--split", args.eval_split])
