@@ -25,7 +25,9 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from tqdm import tqdm
 
 # Adiciona a raiz do repositorio ao PYTHONPATH
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -133,26 +135,38 @@ def _dispositivos_cuda(gpus: str) -> list[str]:
     return [f"cuda:{indice}" for indice in ids]
 
 
+def _ler_jsonl(caminho: Path, desc: str) -> Iterator[dict[str, Any]]:
+    """Le o JSONL e avanca a barra pelo tamanho do arquivo, em bytes."""
+    tamanho = caminho.stat().st_size
+    with caminho.open("rb") as arquivo, tqdm(
+        total=tamanho,
+        desc=desc,
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as barra:
+        for linha_bytes in arquivo:
+            barra.update(len(linha_bytes))
+            texto = linha_bytes.decode("utf-8").strip()
+            if texto:
+                yield json.loads(texto)
+
+
 def carregar_processos_jsonl(caminho: Path) -> list[ProcessoJudicial]:
     """Le arquivo de processos persistido pelo splitter."""
     if not caminho.is_file():
         raise FileNotFoundError(f"Arquivo nao encontrado: {caminho}")
 
     processos = []
-    with caminho.open(encoding="utf-8") as f:
-        for num_linha, linha in enumerate(f, start=1):
-            linha = linha.strip()
-            if not linha:
-                continue
-            dado = json.loads(linha)
-            p = ProcessoJudicial(
-                tribunal=dado.get("str_tribunal", ""),
-                numero_processo=dado.get("str_numero_unico", ""),
-                ementa=dado.get("str_ementa", ""),
-                inteiro_teor=dado.get("str_inteiro_teor", ""),
-                metadados=dado.get("metadados", {}),
-            )
-            processos.append(p)
+    for dado in _ler_jsonl(caminho, "Carregando processos"):
+        p = ProcessoJudicial(
+            tribunal=dado.get("str_tribunal", ""),
+            numero_processo=dado.get("str_numero_unico", ""),
+            ementa=dado.get("str_ementa", ""),
+            inteiro_teor=dado.get("str_inteiro_teor", ""),
+            metadados=dado.get("metadados", {}),
+        )
+        processos.append(p)
     return processos
 
 
@@ -162,24 +176,19 @@ def carregar_chunks_jsonl(caminho: Path) -> list[ChunkProcesso]:
         raise FileNotFoundError(f"Arquivo de chunks nao encontrado: {caminho}")
 
     chunks = []
-    with caminho.open(encoding="utf-8") as f:
-        for linha in f:
-            linha = linha.strip()
-            if not linha:
-                continue
-            dado = json.loads(linha)
-            ch = ChunkProcesso(
-                chunk_id=dado.get("chunk_id", ""),
-                id_global_processo=dado.get("id_global_processo", ""),
-                tribunal=dado.get("str_tribunal", ""),
-                numero_processo=dado.get("str_numero_unico", ""),
-                chunk_idx=int(dado.get("chunk_idx", 0)),
-                n_tokens=int(dado.get("n_tokens", 0)),
-                texto=dado.get("texto", ""),
-                contem_vazamento_ementa=bool(dado.get("contem_vazamento_ementa", False)),
-                motivo_vazamento=dado.get("motivo_vazamento"),
-            )
-            chunks.append(ch)
+    for dado in _ler_jsonl(caminho, "Carregando chunks"):
+        ch = ChunkProcesso(
+            chunk_id=dado.get("chunk_id", ""),
+            id_global_processo=dado.get("id_global_processo", ""),
+            tribunal=dado.get("str_tribunal", ""),
+            numero_processo=dado.get("str_numero_unico", ""),
+            chunk_idx=int(dado.get("chunk_idx", 0)),
+            n_tokens=int(dado.get("n_tokens", 0)),
+            texto=dado.get("texto", ""),
+            contem_vazamento_ementa=bool(dado.get("contem_vazamento_ementa", False)),
+            motivo_vazamento=dado.get("motivo_vazamento"),
+        )
+        chunks.append(ch)
     return chunks
 
 
@@ -248,8 +257,7 @@ def main() -> None:
     print(f"Batch Inferencia    : {encode_batch} | Batch Queries: {query_batch}")
     print("-" * 64)
 
-    # 1. Carregamento dos dados em memoria
-    print("Carregando processos e chunks de treino...")
+    # 1. Carregamento dos dados em memoria. Cada arquivo tem a propria barra.
     processos = carregar_processos_jsonl(arq_processos)
     chunks = carregar_chunks_jsonl(arq_chunks)
 
