@@ -9,7 +9,7 @@ projeto:
 # Caminhos dos Dados
 dados:
   diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
-  diretorio_processados: "data/processed"
+  diretorio_processados: "data/processed_2gpu"
   
   # Lista explicita dos arquivos de pares para processamento.
   # Comente ou descomente as linhas para incluir ou excluir tribunais:
@@ -46,5 +46,5 @@ dados:
 # Diretorios de Saida de Modelos e Logs
 saidas:
   diretorio_experimentos: "experiments"
-  nome_experimento: "exp_001_h200_4b"
+  nome_experimento: "exp_003_h200_4b_2gpu"
   hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"

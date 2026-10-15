@@ -5,6 +5,7 @@ Mineracao vetorial acelerada de Hard Negatives em GPU para aprendizado contrasti
 from __future__ import annotations
 
 import gc
+import inspect
 import json
 import os
 from collections import defaultdict
@@ -68,23 +69,102 @@ def carregar_modelo_mineracao(
     return modelo
 
 
-def encodar_textos_corpus(
+def _encode_aceita_duas_gpus(modelo: SentenceTransformer) -> bool:
+    """A API nova de encode aceita device=["cuda:0", "cuda:1"]. A antiga usa o pool explicito."""
+    # pool e chunk_size so existem no encode que reparte o corpus entre as duas placas.
+    parametros = inspect.signature(modelo.encode).parameters
+    return "pool" in parametros or "chunk_size" in parametros
+
+
+def _encodar_uma_gpu(
     modelo: SentenceTransformer,
     textos: list[str],
-    batch_size: int = 256,
-    show_progress: bool = True,
+    batch_size: int,
+    show_progress: bool,
 ) -> np.ndarray:
-    """
-    Gera representacoes vetoriais normalizadas para todos os textos do corpus.
-    """
-    embeddings = modelo.encode(
+    return modelo.encode(
         textos,
         batch_size=batch_size,
         show_progress_bar=show_progress,
         normalize_embeddings=True,
         convert_to_numpy=True,
     )
-    return embeddings
+
+
+def _iniciar_pool_gpus(modelo: SentenceTransformer, dispositivos: list[str]):
+    # Versoes antigas nomeiam o argumento target_devices; as novas recebem a lista direto.
+    assinatura = inspect.signature(modelo.start_multi_process_pool)
+    if "target_devices" in assinatura.parameters:
+        return modelo.start_multi_process_pool(target_devices=dispositivos)
+    return modelo.start_multi_process_pool(dispositivos)
+
+
+def _encodar_nas_duas_gpus(
+    modelo: SentenceTransformer,
+    textos: list[str],
+    batch_size: int,
+    show_progress: bool,
+    dispositivos: list[str],
+) -> np.ndarray:
+    """
+    Um processo por GPU. A biblioteca devolve as linhas na ordem original dos textos.
+    O pool e fechado antes de voltar, para liberar a copia extra do modelo.
+    """
+    print(f"Vetorizando o corpus em {len(dispositivos)} GPUs: {', '.join(dispositivos)}")
+    # Nao e DDP: cada processo vetoriza um pedaco e a biblioteca junta na ordem original.
+    if _encode_aceita_duas_gpus(modelo):
+        embeddings = modelo.encode(
+            textos,
+            batch_size=batch_size,
+            show_progress_bar=show_progress,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            device=dispositivos,
+        )
+        return _como_matriz_numpy(embeddings)
+
+    if not hasattr(modelo, "start_multi_process_pool") or not hasattr(modelo, "encode_multi_process"):
+        print("Aviso: esta versao do Sentence Transformers nao vetoriza nas duas GPUs. Usando uma placa.")
+        return _encodar_uma_gpu(modelo, textos, batch_size, show_progress)
+
+    pool = None
+    try:
+        pool = _iniciar_pool_gpus(modelo, dispositivos)
+        aceitos = inspect.signature(modelo.encode_multi_process).parameters
+        kwargs = {"batch_size": batch_size, "normalize_embeddings": True}
+        if "show_progress_bar" in aceitos:
+            kwargs["show_progress_bar"] = show_progress
+        embeddings = modelo.encode_multi_process(textos, pool, **kwargs)
+        return _como_matriz_numpy(embeddings)
+    finally:
+        # Fecha os processos antes da busca. Sem isso a placa 0 ficaria com dois modelos e a matriz.
+        if pool is not None:
+            modelo.stop_multi_process_pool(pool)
+
+
+def _como_matriz_numpy(embeddings) -> np.ndarray:
+    # O encode multi-GPU pode devolver tensor, lista de blocos ou ndarray. A gravacao espera ndarray.
+    if isinstance(embeddings, torch.Tensor):
+        return embeddings.detach().float().cpu().numpy()
+    if isinstance(embeddings, list):
+        return np.concatenate([_como_matriz_numpy(parte) for parte in embeddings], axis=0)
+    return np.asarray(embeddings)
+
+
+def encodar_textos_corpus(
+    modelo: SentenceTransformer,
+    textos: list[str],
+    batch_size: int = 256,
+    show_progress: bool = True,
+    dispositivos: list[str] | None = None,
+) -> np.ndarray:
+    """
+    Gera representacoes vetoriais normalizadas para todos os textos do corpus.
+    Com as duas GPUs, reparte os textos entre dois processos da biblioteca.
+    """
+    if dispositivos and len(dispositivos) >= 2:
+        return _encodar_nas_duas_gpus(modelo, textos, batch_size, show_progress, dispositivos)
+    return _encodar_uma_gpu(modelo, textos, batch_size, show_progress)
 
 
 def _caminho_sidecar_embeddings(caminho: Path) -> Path:
@@ -182,6 +262,7 @@ def obter_embeddings_corpus(
     model_id: str,
     encode_batch_size: int,
     recomputar: bool,
+    dispositivos: list[str] | None = None,
 ) -> np.ndarray:
     """
     Reutiliza o .npy quando ele bate com o corpus. Senao, vetoriza e grava em float16.
@@ -207,11 +288,107 @@ def obter_embeddings_corpus(
         textos=textos,
         batch_size=encode_batch_size,
         show_progress=True,
+        dispositivos=dispositivos,
     )
     salvar_embeddings_float16(destino, embeddings, model_id=model_id)
     del embeddings
     gc.collect()
     return carregar_embeddings_float16(destino)
+
+
+def _enviar_fatia_para_gpu(fatia, dispositivo: str, dtype_tensor: torch.dtype) -> torch.Tensor:
+    # torch.from_numpy exige um array.
+    arr = np.ascontiguousarray(fatia)
+    if not arr.flags.writeable:
+        arr = np.array(arr, copy=True)
+    return torch.from_numpy(arr).to(device=dispositivo, dtype=dtype_tensor)
+
+
+def _montar_shards(
+    corpus_embs_cpu: np.ndarray,
+    dispositivos: list[str],
+    dtype_tensor: torch.dtype,
+) -> list[tuple[int, torch.Tensor]]:
+    """Cada GPU fica com uma fatia contigua da matriz, na ordem original das linhas."""
+    n_linhas = corpus_embs_cpu.shape[0]
+    shards: list[tuple[int, torch.Tensor]] = []
+    for indice, dispositivo in enumerate(dispositivos):
+        # Corte inteiro: a ultima placa absorve o resto se a divisao nao for exata.
+        inicio = (n_linhas * indice) // len(dispositivos)
+        fim = (n_linhas * (indice + 1)) // len(dispositivos)
+        if inicio == fim:
+            continue
+        print(f"  Fatia {indice}: linhas {inicio:,}-{fim - 1:,} em {dispositivo}")
+        shards.append((inicio, _enviar_fatia_para_gpu(corpus_embs_cpu[inicio:fim], dispositivo, dtype_tensor)))
+    return shards
+
+
+def _mascarar_mesmo_processo(
+    sims: torch.Tensor,
+    offset: int,
+    n_local: int,
+    batch_procs: list[ProcessoJudicial],
+    indices_por_processo: dict[str, list[int]],
+) -> None:
+    # O indice global vira indice local da fatia. Chunk de outro processo, ou de outra placa, fica de fora.
+    for i_local, proc in enumerate(batch_procs):
+        locais = [
+            idx - offset
+            for idx in indices_por_processo[proc.id_global]
+            if offset <= idx < offset + n_local
+        ]
+        if locais:
+            sims[i_local, locais] = -1e9
+
+
+def _topk_numa_fatia(
+    q_embs: torch.Tensor,
+    matriz: torch.Tensor,
+    offset: int,
+    batch_procs: list[ProcessoJudicial],
+    indices_por_processo: dict[str, list[int]],
+    k: int,
+    dtype_tensor: torch.dtype,
+) -> tuple[np.ndarray, np.ndarray]:
+    # As ementas nascem numa placa so. A copia para a fatia e pequena: 256 vetores.
+    q_local = q_embs.to(device=matriz.device, dtype=dtype_tensor)
+    sims = torch.matmul(q_local, matriz.T)
+    _mascarar_mesmo_processo(sims, offset, matriz.shape[0], batch_procs, indices_por_processo)
+    k_local = min(k, matriz.shape[0])
+    scores, indices = torch.topk(sims, k=k_local, dim=-1)
+    # Soma o deslocamento da fatia para o indice voltar a ser o da matriz completa.
+    return scores.float().cpu().numpy(), indices.cpu().numpy() + offset
+
+
+def _juntar_topk(
+    partes_scores: list[np.ndarray],
+    partes_indices: list[np.ndarray],
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    O top-k global esta dentro do top-k de cada metade.
+    Juntar os topos e cortar de novo em k devolve o mesmo conjunto de uma matriz so.
+    """
+    scores = np.concatenate(partes_scores, axis=1)
+    indices = np.concatenate(partes_indices, axis=1)
+    k_final = min(k, scores.shape[1])
+    # O sinal negativo coloca os mais similares primeiro. -1e9, o mascarado, vai para o fim.
+    ordem = np.argsort(-scores, axis=1)[:, :k_final]
+    return np.take_along_axis(scores, ordem, axis=1), np.take_along_axis(indices, ordem, axis=1)
+
+
+def _esvaziar_cache(shards: list[tuple[int, torch.Tensor]] | None, device: torch.device) -> None:
+    # empty_cache so limpa a placa corrente. Com duas fatias, troca o dispositivo antes de cada chamada.
+    if shards:
+        vistos = set()
+        for _, matriz in shards:
+            if matriz.is_cuda and matriz.device not in vistos:
+                vistos.add(matriz.device)
+                with torch.cuda.device(matriz.device):
+                    torch.cuda.empty_cache()
+        return
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def minerar_tripletos_contrastivos(
@@ -230,6 +407,7 @@ def minerar_tripletos_contrastivos(
     model_id: str = "Qwen/Qwen3-Embedding-4B",
     arquivo_embeddings: Path | str | None = None,
     recomputar_embeddings: bool = False,
+    dispositivos: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Executa a mineracao em lote de tripletos.
@@ -267,10 +445,18 @@ def minerar_tripletos_contrastivos(
         model_id=model_id,
         encode_batch_size=encode_batch_size,
         recomputar=recomputar_embeddings,
+        dispositivos=dispositivos,
     )
 
-    print(f"Transferindo matriz de embeddings {tuple(corpus_embs_cpu.shape)} para {device} em {dtype_tensor}...")
-    corpus_embs_gpu = torch.from_numpy(corpus_embs_cpu).to(device=device, dtype=dtype_tensor)
+    usar_duas_gpus = bool(dispositivos and len(dispositivos) >= 2)
+    shards: list[tuple[int, torch.Tensor]] | None = None
+    if usar_duas_gpus:
+        print(f"Dividindo a matriz entre {len(dispositivos)} GPUs ...")
+        shards = _montar_shards(corpus_embs_cpu, list(dispositivos), dtype_tensor) or None
+    corpus_embs_gpu = None
+    if shards is None:
+        print(f"Transferindo matriz de embeddings {tuple(corpus_embs_cpu.shape)} para {device} em {dtype_tensor}...")
+        corpus_embs_gpu = torch.from_numpy(corpus_embs_cpu).to(device=device, dtype=dtype_tensor)
 
     stats = {
         "processos_avaliados": 0,
@@ -302,20 +488,41 @@ def minerar_tripletos_contrastivos(
                     show_progress_bar=False,
                 ).to(dtype=dtype_tensor, device=device)
 
-                # Multiplicacao de matrizes em lote na GPU: (B, D) x (D, N) -> Shape (B, N)
-                sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
+                # Duas placas: top-k em cada metade e juncao. Uma placa: a matriz inteira, como antes.
+                if shards is not None:
+                    partes_scores = []
+                    partes_indices = []
+                    for offset, matriz in shards:
+                        scores_fatia, indices_fatia = _topk_numa_fatia(
+                            q_embs=q_embs_gpu,
+                            matriz=matriz,
+                            offset=offset,
+                            batch_procs=batch_procs,
+                            indices_por_processo=indices_por_processo,
+                            k=k_candidatos_gpu,
+                            dtype_tensor=dtype_tensor,
+                        )
+                        partes_scores.append(scores_fatia)
+                        partes_indices.append(indices_fatia)
+                    top_scores_cpu, top_indices_cpu = _juntar_topk(
+                        partes_scores, partes_indices, k_candidatos_gpu
+                    )
+                else:
+                    # Multiplicacao de matrizes em lote na GPU: (B, D) x (D, N) -> Shape (B, N)
+                    sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
 
-                # Mascara chunks do mesmo processo judicial diretamente na GPU
-                for i_local, proc in enumerate(batch_procs):
-                    pos_idx_list = indices_por_processo[proc.id_global]
-                    sims_batch_gpu[i_local, pos_idx_list] = -1e9
+                    # Mascara chunks do mesmo processo judicial diretamente na GPU
+                    for i_local, proc in enumerate(batch_procs):
+                        pos_idx_list = indices_por_processo[proc.id_global]
+                        sims_batch_gpu[i_local, pos_idx_list] = -1e9
 
-                # Top-K direto na GPU: extrai apenas os candidatos mais proximos
-                top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
+                    # Top-K direto na GPU: extrai apenas os candidatos mais proximos
+                    top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
 
-                # Transfere para CPU apenas os indices e scores necessarios (array compacto)
-                top_scores_cpu = top_scores_gpu.cpu().float().numpy()
-                top_indices_cpu = top_indices_gpu.cpu().numpy()
+                    # Transfere para CPU apenas os indices e scores necessarios (array compacto)
+                    top_scores_cpu = top_scores_gpu.cpu().float().numpy()
+                    top_indices_cpu = top_indices_gpu.cpu().numpy()
+
                 q_embs_cpu = q_embs_gpu.cpu().float().numpy()
 
             # Processamento rapido dos candidatos selecionados
@@ -394,8 +601,7 @@ def minerar_tripletos_contrastivos(
                     stats["tripletos_salvos"] += 1
                     soma_margens += margem
 
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
+            _esvaziar_cache(shards, device)
 
     if stats["tripletos_salvos"] > 0:
         stats["media_margem_tripletos"] = round(soma_margens / stats["tripletos_salvos"], 4)

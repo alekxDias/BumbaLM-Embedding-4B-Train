@@ -33,6 +33,9 @@ Permite executar o pipeline completo de ponta a ponta ou etapas especificas:
 7b. Treino nas duas GPUs (DDP, lote de 64 por placa):
    python scripts/run_pipeline.py --steps train --gpus 0,1
 
+7c. Mineracao nas duas GPUs (vetorizacao e busca repartidas; nao usa torchrun):
+   python scripts/run_pipeline.py --steps mine --gpus 0,1
+
 8. Apenas avaliacao do modelo salvo contra o modelo baseline zero-shot no conjunto de teste:
    python scripts/run_pipeline.py --steps eval --compare_baseline
 
@@ -141,7 +144,7 @@ def parse_args() -> argparse.Namespace:
         "--gpus",
         type=str,
         default=None,
-        help="GPUs da etapa train. Ex.: '1' ou '0,1'. Repassado ao script de treino.",
+        help="GPUs das etapas mine e train. Ex.: '1' ou '0,1'.",
     )
     return parser.parse_args()
 
@@ -225,8 +228,12 @@ def main() -> None:
             if args.max_por_tribunal:
                 cmd.extend(["--max_por_tribunal", str(args.max_por_tribunal)])
 
-        if etapa == "mine" and args.batch_size:
-            cmd.extend(["--batch_size", str(args.batch_size)])
+        if etapa == "mine":
+            if args.batch_size:
+                cmd.extend(["--batch_size", str(args.batch_size)])
+            # A mineracao reparte vetorizacao e busca. Nao usa o torchrun do treino.
+            if args.gpus:
+                cmd.extend(["--gpus", args.gpus])
 
         if etapa == "train":
             if args.batch_size:

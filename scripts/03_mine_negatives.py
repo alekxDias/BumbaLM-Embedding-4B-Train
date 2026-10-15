@@ -14,6 +14,7 @@ Executa:
 Uso:
     python scripts/03_mine_negatives.py
     python scripts/03_mine_negatives.py --device cuda
+    python scripts/03_mine_negatives.py --gpus 0,1
     python scripts/03_mine_negatives.py --recompute_embeddings
 """
 
@@ -101,7 +102,35 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignora o .npy existente e calcula os vetores do corpus de novo.",
     )
+    parser.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="GPUs da mineracao, separadas por virgula. Ex.: '0,1'. Vazio ou uma so placa mantem o processo unico. Sobrescreve hardware.gpus.",
+    )
     return parser.parse_args()
+
+
+def _ids_gpus(texto: str) -> list[str]:
+    return [parte.strip() for parte in str(texto or "").split(",") if parte.strip()]
+
+
+def _resolver_gpus(args: argparse.Namespace, cfg_train: dict[str, Any]) -> str:
+    # A flag --gpus ganha do YAML. Vazio mantem a mineracao numa placa so.
+    if args.gpus is not None:
+        return args.gpus.strip()
+    bruto = cfg_train.get("hardware", {}).get("gpus")
+    if bruto is None:
+        return ""
+    return str(bruto).strip()
+
+
+def _dispositivos_cuda(gpus: str) -> list[str]:
+    # "0,1" vira ["cuda:0", "cuda:1"]. Uma placa, ou campo vazio, nao abre o caminho repartido.
+    ids = _ids_gpus(gpus)
+    if len(ids) < 2:
+        return []
+    return [f"cuda:{indice}" for indice in ids]
 
 
 def carregar_processos_jsonl(caminho: Path) -> list[ProcessoJudicial]:
@@ -202,6 +231,8 @@ def main() -> None:
         "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: ",
     )
     attn_impl = modelo_cfg.get("attn_implementation", "sdpa")
+    gpus_txt = _resolver_gpus(args, cfg_train)
+    dispositivos = _dispositivos_cuda(gpus_txt)
 
     print("=" * 64)
     print("BumbaLM - Etapa 3: Mineracao de Hard Negatives em GPU")
@@ -211,6 +242,7 @@ def main() -> None:
     print(f"Arquivo de Saida    : {arq_saida}")
     print(f"Arquivo de Vetores  : {arq_embeddings}")
     print(f"Modelo de Mineracao : {model_id}")
+    print(f"GPUs da mineracao   : {gpus_txt or 'padrao (uma placa)'}")
     print(f"Faixa de Cosseno    : [{lim_min}, {lim_max}] | TOP_K: {top_k}")
     print(f"Negativos por Chunk : {n_neg}")
     print(f"Batch Inferencia    : {encode_batch} | Batch Queries: {query_batch}")
@@ -248,6 +280,7 @@ def main() -> None:
         model_id=model_id,
         arquivo_embeddings=arq_embeddings,
         recomputar_embeddings=args.recompute_embeddings,
+        dispositivos=dispositivos or None,
     )
 
     # 4. Emissao de relatorio de mineracao

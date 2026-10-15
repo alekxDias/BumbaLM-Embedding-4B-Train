@@ -1,9 +1,9 @@
 # Parametros de Treinamento
 
 hardware:
-  # Vazio: um processo na GPU ja visivel (CUDA_VISIBLE_DEVICES continua valendo).
-  # "1": somente a segunda placa. "0,1": DDP nas duas, 64 exemplos por placa.
-  gpus: ""
+  # Vazio: uma GPU. "1": somente a segunda placa.
+  # "0,1": treino em DDP e mineracao nas duas placas.
+  gpus: "0,1"
 
 modelo:
   model_id: "Qwen/Qwen3-Embedding-4B"
