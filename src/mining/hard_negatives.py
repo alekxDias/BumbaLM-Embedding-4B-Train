@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -22,6 +23,9 @@ DEFAULT_QUERY_INSTRUCTION = (
     "Instruct: Dado um trecho de um documento jurídico brasileiro, "
     "recupere o trecho mais relevante semanticamente.\nQuery: "
 )
+
+NOME_ARQUIVO_EMBEDDINGS = "corpus_embeddings_f16.npy"
+_BLOCO_GRAVACAO_EMBEDDINGS = 100_000
 
 
 def preparar_query_com_instrucao(query: str, instrucao: str = DEFAULT_QUERY_INSTRUCTION) -> str:
@@ -83,6 +87,133 @@ def encodar_textos_corpus(
     return embeddings
 
 
+def _caminho_sidecar_embeddings(caminho: Path) -> Path:
+    return caminho.with_suffix(".json")
+
+
+def _embeddings_compativeis(caminho: Path, n_chunks: int, model_id: str) -> bool:
+    """Confere se o .npy e o sidecar descrevem este corpus e este modelo."""
+    sidecar = _caminho_sidecar_embeddings(caminho)
+    if not caminho.is_file() or not sidecar.is_file():
+        return False
+    try:
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        if int(meta.get("n_chunks", -1)) != n_chunks or meta.get("model_id") != model_id:
+            return False
+        if meta.get("dtype") != "float16":
+            return False
+        arr = np.load(caminho, mmap_mode="r")
+        dim = int(meta.get("dim", -1))
+        compativel = (
+            arr.ndim == 2
+            and arr.shape[0] == n_chunks
+            and arr.dtype == np.float16
+            and (dim < 1 or arr.shape[1] == dim)
+        )
+        del arr
+        return compativel
+    except Exception as exc:
+        print(f"Aviso: embeddings em {caminho} ignorados ({exc}).")
+        return False
+
+
+def salvar_embeddings_float16(
+    caminho: Path | str,
+    embeddings: np.ndarray,
+    model_id: str,
+    bloco: int = _BLOCO_GRAVACAO_EMBEDDINGS,
+) -> None:
+    """
+    Grava a matriz em float16 por blocos.
+
+    O arquivo final so substitui o anterior depois da escrita completa.
+    O sidecar JSON e gravado em seguida, para um .npy pela metade nao ser reutilizado.
+    """
+    destino = Path(caminho)
+    if embeddings.ndim != 2:
+        raise ValueError(f"Matriz de embeddings deve ser 2D, recebeu shape {embeddings.shape}.")
+
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    temporario = destino.with_name(destino.name + ".tmp")
+    if temporario.exists():
+        temporario.unlink()
+
+    mapa = np.lib.format.open_memmap(
+        os.fspath(temporario),
+        mode="w+",
+        dtype=np.float16,
+        shape=embeddings.shape,
+    )
+    n_linhas = embeddings.shape[0]
+    for inicio in tqdm(range(0, n_linhas, bloco), desc="Salvando embeddings float16"):
+        fim = min(inicio + bloco, n_linhas)
+        mapa[inicio:fim] = embeddings[inicio:fim]
+    mapa.flush()
+    mmap = getattr(mapa, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
+    del mapa
+    gc.collect()
+    os.replace(temporario, destino)
+
+    meta = {
+        "model_id": model_id,
+        "n_chunks": int(n_linhas),
+        "dim": int(embeddings.shape[1]),
+        "dtype": "float16",
+        "normalizado": True,
+    }
+    sidecar = _caminho_sidecar_embeddings(destino)
+    sidecar_tmp = sidecar.with_name(sidecar.name + ".tmp")
+    sidecar_tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(sidecar_tmp, sidecar)
+    print(f"Embeddings salvos: {destino} ({n_linhas:,} x {embeddings.shape[1]}, float16)")
+
+
+def carregar_embeddings_float16(caminho: Path | str) -> np.ndarray:
+    """Carrega a matriz em mmap para nao duplicar os ~68 GB na RAM."""
+    return np.load(caminho, mmap_mode="c")
+
+
+def obter_embeddings_corpus(
+    modelo: SentenceTransformer,
+    textos: list[str],
+    caminho: Path | str,
+    model_id: str,
+    encode_batch_size: int,
+    recomputar: bool,
+) -> np.ndarray:
+    """
+    Reutiliza o .npy quando ele bate com o corpus. Senao, vetoriza e grava em float16.
+    """
+    destino = Path(caminho)
+    n_chunks = len(textos)
+
+    if not recomputar and _embeddings_compativeis(destino, n_chunks, model_id):
+        print(f"Reutilizando embeddings: {destino}")
+        print("Vetorizacao do corpus ignorada.")
+        return carregar_embeddings_float16(destino)
+
+    if recomputar:
+        print("Recalculo de embeddings solicitado.")
+    elif destino.is_file():
+        print("Embeddings existentes nao batem com este corpus ou modelo. Vetorizando de novo...")
+    else:
+        print("Arquivo de embeddings ausente. Vetorizando o corpus...")
+
+    print("Gerando embeddings de todos os chunks do corpus ...")
+    embeddings = encodar_textos_corpus(
+        modelo=modelo,
+        textos=textos,
+        batch_size=encode_batch_size,
+        show_progress=True,
+    )
+    salvar_embeddings_float16(destino, embeddings, model_id=model_id)
+    del embeddings
+    gc.collect()
+    return carregar_embeddings_float16(destino)
+
+
 def minerar_tripletos_contrastivos(
     modelo: SentenceTransformer,
     processos: list[ProcessoJudicial],
@@ -96,6 +227,9 @@ def minerar_tripletos_contrastivos(
     query_batch_size: int = 256,
     query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
     ignorar_chunk_0_como_positivo: bool = True,
+    model_id: str = "Qwen/Qwen3-Embedding-4B",
+    arquivo_embeddings: Path | str | None = None,
+    recomputar_embeddings: bool = False,
 ) -> dict[str, Any]:
     """
     Executa a mineracao em lote de tripletos.
@@ -124,16 +258,18 @@ def minerar_tripletos_contrastivos(
     print(f"Total de chunks a vetorizar: {total_chunks:,}")
     print(f"Total de processos para consulta: {len(processos_validos):,}")
 
-    # 2. Vetorizacao de todo o corpus de chunks
-    print("Gerando embeddings de todos os chunks do corpus ...")
-    corpus_embs_cpu = encodar_textos_corpus(
+    # 2. Vetorizacao do corpus, ou reuso do .npy float16 ja gravado
+    caminho_embeddings = Path(arquivo_embeddings) if arquivo_embeddings else (saida.parent / NOME_ARQUIVO_EMBEDDINGS)
+    corpus_embs_cpu = obter_embeddings_corpus(
         modelo=modelo,
         textos=textos_corpus,
-        batch_size=encode_batch_size,
-        show_progress=True,
+        caminho=caminho_embeddings,
+        model_id=model_id,
+        encode_batch_size=encode_batch_size,
+        recomputar=recomputar_embeddings,
     )
 
-    print(f"Transferindo matriz de embeddings ({corpus_embs_cpu.shape}) para {device} em {dtype_tensor}...")
+    print(f"Transferindo matriz de embeddings {tuple(corpus_embs_cpu.shape)} para {device} em {dtype_tensor}...")
     corpus_embs_gpu = torch.from_numpy(corpus_embs_cpu).to(device=device, dtype=dtype_tensor)
 
     stats = {
@@ -203,7 +339,7 @@ def minerar_tripletos_contrastivos(
 
                 cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
                 cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
-                cand_embs_mat = corpus_embs_cpu[cand_indices_array]  # Shape (K, D)
+                cand_embs_mat = np.asarray(corpus_embs_cpu[cand_indices_array], dtype=np.float32)
 
                 for pos_idx in pos_indices:
                     ch_positivo = chunks_corpus[pos_idx]
@@ -218,7 +354,7 @@ def minerar_tripletos_contrastivos(
 
                     stats["chunks_positivos_avaliados"] += 1
 
-                    pos_emb_vec = corpus_embs_cpu[pos_idx]  # Shape (D,)
+                    pos_emb_vec = np.asarray(corpus_embs_cpu[pos_idx], dtype=np.float32)
 
                     # Similaridade de cosseno com o positivo apenas sobre os candidatos: (K,)
                     sims_p_array = np.dot(cand_embs_mat, pos_emb_vec)

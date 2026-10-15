@@ -6,6 +6,7 @@ Executa:
 1. Leitura dos processos de treino ('train_processos.jsonl') e dos chunks ('train_corpus_chunks.jsonl').
 2. Inicializacao do modelo base para inferencia vetorial acelerada (Qwen3).
 3. Geracao de embeddings normalizados para todo o corpus de chunks do treino.
+   Se corpus_embeddings_f16.npy ja for valido, a vetorizacao e pulada.
 4. Comparacao matricial em GPU e selecao de 5 hard negatives por positivo (na faixa [0.60, 0.85]).
 5. Persistencia das instancias de treino no formato de tripletos ('train_triplets.jsonl').
 6. Emissao de relatorio com distribuicao de margens e cobertura de chunks.
@@ -13,6 +14,7 @@ Executa:
 Uso:
     python scripts/03_mine_negatives.py
     python scripts/03_mine_negatives.py --device cuda
+    python scripts/03_mine_negatives.py --recompute_embeddings
 """
 
 from __future__ import annotations
@@ -87,6 +89,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Dispositivo de execucao ('cuda' ou 'cpu'). Padrao: automatico.",
+    )
+    parser.add_argument(
+        "--embeddings_file",
+        type=Path,
+        default=None,
+        help="Caminho do .npy float16 dos vetores do corpus. Padrao: corpus_embeddings_f16.npy na pasta processada.",
+    )
+    parser.add_argument(
+        "--recompute_embeddings",
+        action="store_true",
+        help="Ignora o .npy existente e calcula os vetores do corpus de novo.",
     )
     return parser.parse_args()
 
@@ -168,6 +181,10 @@ def main() -> None:
     if not Path(arq_saida).is_absolute():
         arq_saida = BASE_DIR / arq_saida
 
+    arq_embeddings = args.embeddings_file or (dir_processados / "corpus_embeddings_f16.npy")
+    if not Path(arq_embeddings).is_absolute():
+        arq_embeddings = BASE_DIR / arq_embeddings
+
     # Parametros de mineracao
     mining_cfg = cfg_data.get("mineracao_negativos", {})
     n_neg = mining_cfg.get("n_negativos", 5)
@@ -192,6 +209,7 @@ def main() -> None:
     print(f"Processos de Treino : {arq_processos}")
     print(f"Chunks de Treino    : {arq_chunks}")
     print(f"Arquivo de Saida    : {arq_saida}")
+    print(f"Arquivo de Vetores  : {arq_embeddings}")
     print(f"Modelo de Mineracao : {model_id}")
     print(f"Faixa de Cosseno    : [{lim_min}, {lim_max}] | TOP_K: {top_k}")
     print(f"Negativos por Chunk : {n_neg}")
@@ -227,6 +245,9 @@ def main() -> None:
         query_batch_size=query_batch,
         query_instruction=query_instruction,
         ignorar_chunk_0_como_positivo=True,
+        model_id=model_id,
+        arquivo_embeddings=arq_embeddings,
+        recomputar_embeddings=args.recompute_embeddings,
     )
 
     # 4. Emissao de relatorio de mineracao
@@ -243,6 +264,7 @@ def main() -> None:
         f.write(f"Tripletos Gerados        : {stats['tripletos_salvos']:,}\n")
         f.write(f"Chunks sem 5 Negativos   : {stats['chunks_sem_negativos_suficientes']:,}\n")
         f.write(f"Margem Media (Pos - Neg) : {stats['media_margem_tripletos']:.4f}\n")
+        f.write(f"Embeddings do Corpus     : {arq_embeddings}\n")
 
     print("\n" + "=" * 64)
     print("Resumo da Mineracao de Tripletos:")
@@ -250,6 +272,7 @@ def main() -> None:
     print(f"  - Chunks sem 5 negativos        : {stats['chunks_sem_negativos_suficientes']:,}")
     print(f"  - Margem media (pos - neg max)  : {stats['media_margem_tripletos']:.4f}")
     print(f"Arquivo de saida salvo em         : {arq_saida}")
+    print(f"Embeddings do corpus              : {arq_embeddings}")
     print(f"Relatorio salvo em                : {relatorio_txt}")
     print("=" * 64)
     print("Etapa 3 finalizada com sucesso.")
