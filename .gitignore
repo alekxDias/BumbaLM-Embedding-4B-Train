@@ -41,6 +41,9 @@ data/processed/*
 experiments/*
 !experiments/.gitkeep
 
+# Documentacao local (nao sobe para o repositorio)
+docs/
+
 # IDE and OS files
 .vscode/
 .idea/

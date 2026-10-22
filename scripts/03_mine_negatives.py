@@ -9,6 +9,7 @@ Executa:
    Se corpus_embeddings_f16.npy ja for valido, a vetorizacao e pulada.
 4. Comparacao matricial em GPU e selecao de 5 hard negatives por positivo (na faixa [0.60, 0.85]).
 5. Persistencia das instancias de treino no formato de tripletos ('train_triplets.jsonl').
+   Se o JSONL ja existir, a busca continua de onde parou.
 6. Emissao de relatorio com distribuicao de margens e cobertura de chunks.
 
 Uso:
@@ -16,6 +17,7 @@ Uso:
     python scripts/03_mine_negatives.py --device cuda
     python scripts/03_mine_negatives.py --gpus 0,1
     python scripts/03_mine_negatives.py --recompute_embeddings
+    python scripts/03_mine_negatives.py --recompute_triplets
 """
 
 from __future__ import annotations
@@ -105,6 +107,11 @@ def parse_args() -> argparse.Namespace:
         help="Ignora o .npy existente e calcula os vetores do corpus de novo.",
     )
     parser.add_argument(
+        "--recompute_triplets",
+        action="store_true",
+        help="Apaga train_triplets.jsonl e o sidecar de progresso e refaz a busca do zero.",
+    )
+    parser.add_argument(
         "--gpus",
         type=str,
         default=None,
@@ -153,17 +160,19 @@ def _ler_jsonl(caminho: Path, desc: str) -> Iterator[dict[str, Any]]:
 
 
 def carregar_processos_jsonl(caminho: Path) -> list[ProcessoJudicial]:
-    """Le arquivo de processos persistido pelo splitter."""
+    """Le os processos sem o inteiro teor. A mineracao so usa ementa, id e tribunal."""
     if not caminho.is_file():
         raise FileNotFoundError(f"Arquivo nao encontrado: {caminho}")
 
     processos = []
     for dado in _ler_jsonl(caminho, "Carregando processos"):
+        # O teor continua no JSONL do disco. Etapas 1 e 2 e que leem esse campo.
+        dado.pop("str_inteiro_teor", None)
         p = ProcessoJudicial(
             tribunal=dado.get("str_tribunal", ""),
             numero_processo=dado.get("str_numero_unico", ""),
             ementa=dado.get("str_ementa", ""),
-            inteiro_teor=dado.get("str_inteiro_teor", ""),
+            inteiro_teor="",
             metadados=dado.get("metadados", {}),
         )
         processos.append(p)
@@ -255,13 +264,14 @@ def main() -> None:
     print(f"Faixa de Cosseno    : [{lim_min}, {lim_max}] | TOP_K: {top_k}")
     print(f"Negativos por Chunk : {n_neg}")
     print(f"Batch Inferencia    : {encode_batch} | Batch Queries: {query_batch}")
+    print(f"Tripletos           : {'recomecar do zero' if args.recompute_triplets else 'retomar se o arquivo existir'}")
     print("-" * 64)
 
     # 1. Carregamento dos dados em memoria. Cada arquivo tem a propria barra.
     processos = carregar_processos_jsonl(arq_processos)
     chunks = carregar_chunks_jsonl(arq_chunks)
 
-    print(f"Processos carregados: {len(processos):,}")
+    print(f"Processos carregados: {len(processos):,} (sem inteiro teor)")
     print(f"Chunks carregados   : {len(chunks):,}")
 
     # 2. Inicializacao do modelo
@@ -289,6 +299,7 @@ def main() -> None:
         arquivo_embeddings=arq_embeddings,
         recomputar_embeddings=args.recompute_embeddings,
         dispositivos=dispositivos or None,
+        retomar=not args.recompute_triplets,
     )
 
     # 4. Emissao de relatorio de mineracao
@@ -301,8 +312,10 @@ def main() -> None:
         f.write(f"Faixa de Similaridade    : [{lim_min}, {lim_max}]\n")
         f.write(f"Negativos por Instancia  : {n_neg}\n")
         f.write(f"Processos Avaliados      : {stats['processos_avaliados']:,}\n")
+        f.write(f"Processos ja gravados    : {stats.get('processos_pulados', 0):,}\n")
         f.write(f"Positivos Avaliados      : {stats['chunks_positivos_avaliados']:,}\n")
         f.write(f"Tripletos Gerados        : {stats['tripletos_salvos']:,}\n")
+        f.write(f"Tripletos desta execucao : {stats.get('tripletos_novos', stats['tripletos_salvos']):,}\n")
         f.write(f"Chunks sem 5 Negativos   : {stats['chunks_sem_negativos_suficientes']:,}\n")
         f.write(f"Margem Media (Pos - Neg) : {stats['media_margem_tripletos']:.4f}\n")
         f.write(f"Embeddings do Corpus     : {arq_embeddings}\n")
@@ -310,6 +323,8 @@ def main() -> None:
     print("\n" + "=" * 64)
     print("Resumo da Mineracao de Tripletos:")
     print(f"  - Tripletos gerados com sucesso : {stats['tripletos_salvos']:,}")
+    print(f"  - Tripletos desta execucao      : {stats.get('tripletos_novos', 0):,}")
+    print(f"  - Processos retomados           : {stats.get('processos_pulados', 0):,}")
     print(f"  - Chunks sem 5 negativos        : {stats['chunks_sem_negativos_suficientes']:,}")
     print(f"  - Margem media (pos - neg max)  : {stats['media_margem_tripletos']:.4f}")
     print(f"Arquivo de saida salvo em         : {arq_saida}")

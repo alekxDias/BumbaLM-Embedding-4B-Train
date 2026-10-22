@@ -8,6 +8,7 @@ import gc
 import inspect
 import json
 import os
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -27,6 +28,8 @@ DEFAULT_QUERY_INSTRUCTION = (
 
 NOME_ARQUIVO_EMBEDDINGS = "corpus_embeddings_f16.npy"
 _BLOCO_GRAVACAO_EMBEDDINGS = 100_000
+# Le so o id_global na retomada, sem montar o JSON inteiro da linha.
+_RE_ID_GLOBAL = re.compile(rb'"id_global"\s*:\s*"([^"\\]+)"')
 
 
 def preparar_query_com_instrucao(query: str, instrucao: str = DEFAULT_QUERY_INSTRUCTION) -> str:
@@ -251,7 +254,7 @@ def salvar_embeddings_float16(
 
 
 def carregar_embeddings_float16(caminho: Path | str) -> np.ndarray:
-    """Carrega a matriz em mmap para nao duplicar os ~68 GB na RAM."""
+    """Carrega a matriz em mmap."""
     return np.load(caminho, mmap_mode="c")
 
 
@@ -377,18 +380,300 @@ def _juntar_topk(
     return np.take_along_axis(scores, ordem, axis=1), np.take_along_axis(indices, ordem, axis=1)
 
 
-def _esvaziar_cache(shards: list[tuple[int, torch.Tensor]] | None, device: torch.device) -> None:
-    # empty_cache so limpa a placa corrente. Com duas fatias, troca o dispositivo antes de cada chamada.
-    if shards:
-        vistos = set()
-        for _, matriz in shards:
-            if matriz.is_cuda and matriz.device not in vistos:
-                vistos.add(matriz.device)
-                with torch.cuda.device(matriz.device):
-                    torch.cuda.empty_cache()
-        return
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
+def _coletar_linhas_do_corpus(
+    indices: np.ndarray,
+    shards: list[tuple[int, torch.Tensor]] | None,
+    corpus_embs_gpu: torch.Tensor | None,
+    dispositivo: torch.device,
+    dtype_tensor: torch.dtype,
+) -> torch.Tensor:
+    """
+    Copia so as linhas pedidas a partir da matriz que ja esta na GPU.
+    Nao volta no .npy mapeado em disco.
+    """
+    idx = torch.as_tensor(np.ascontiguousarray(indices, dtype=np.int64), dtype=torch.long)
+    if idx.ndim != 1:
+        idx = idx.reshape(-1)
+    if shards is None:
+        if corpus_embs_gpu is None:
+            raise RuntimeError("Matriz do corpus ausente na GPU.")
+        dim = corpus_embs_gpu.shape[1]
+        fonte = corpus_embs_gpu
+    else:
+        dim = shards[0][1].shape[1]
+        fonte = None
+    if idx.numel() == 0:
+        return torch.empty((0, dim), device=dispositivo, dtype=dtype_tensor)
+
+    # Uma placa: a matriz inteira ja esta em corpus_embs_gpu.
+    if fonte is not None:
+        return fonte.index_select(0, idx.to(fonte.device)).to(device=dispositivo, dtype=dtype_tensor)
+
+    # Duas placas: cada indice global cai numa fatia. O local e indice menos o offset.
+    saida = torch.empty((idx.shape[0], dim), device=dispositivo, dtype=dtype_tensor)
+    idx_cpu = idx.cpu()
+    for offset, matriz in shards:
+        n_local = matriz.shape[0]
+        no_shard = (idx_cpu >= offset) & (idx_cpu < offset + n_local)
+        if not bool(no_shard.any()):
+            continue
+        posicoes = torch.nonzero(no_shard, as_tuple=False).squeeze(1)
+        locais = (idx_cpu[no_shard] - offset).to(device=matriz.device)
+        linhas = matriz.index_select(0, locais).to(device=dispositivo, dtype=dtype_tensor)
+        saida[posicoes.to(dispositivo)] = linhas
+    return saida
+
+
+def _caminho_sidecar_progresso(saida: Path) -> Path:
+    # train_triplets.jsonl -> train_triplets.progress.json
+    return saida.with_suffix(".progress.json")
+
+
+def _progresso_vazio(n_chunks_corpus: int) -> dict[str, Any]:
+    return {
+        "n_processos_concluidos": 0,
+        "ultimo_id_global": "",
+        "tripletos_salvos": 0,
+        "byte_offset": 0,
+        "n_chunks_corpus": int(n_chunks_corpus),
+    }
+
+
+def _gravar_progresso(caminho: Path, progresso: dict[str, Any]) -> None:
+    # tmp + replace: um sidecar pela metade nao e lido na proxima execucao.
+    temporario = caminho.with_name(caminho.name + ".tmp")
+    temporario.write_text(json.dumps(progresso, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temporario, caminho)
+
+
+def _ler_progresso(caminho: Path) -> dict[str, Any] | None:
+    if not caminho.is_file():
+        return None
+    try:
+        meta = json.loads(caminho.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _progresso_compativel(
+    progresso: dict[str, Any] | None,
+    saida: Path,
+    n_chunks_corpus: int,
+    processos_validos: list[ProcessoJudicial],
+) -> dict[str, Any] | None:
+    """Confere se o sidecar descreve este corpus e este JSONL."""
+    if not progresso or not saida.is_file():
+        return None
+    try:
+        n_proc = int(progresso.get("n_processos_concluidos", 0))
+        offset = int(progresso.get("byte_offset", -1))
+        n_chunks = int(progresso.get("n_chunks_corpus", -1))
+        n_trip = int(progresso.get("tripletos_salvos", 0))
+    except (TypeError, ValueError):
+        return None
+    if n_chunks != n_chunks_corpus or n_proc < 0 or n_proc > len(processos_validos) or n_trip < 0:
+        return None
+    tamanho = saida.stat().st_size
+    if offset < 0 or offset > tamanho:
+        return None
+    # Sidecar zerado com arquivo cheio: nao e retomada, e um sidecar velho. Varre o JSONL.
+    if n_proc == 0 and tamanho > 0:
+        return None
+    if n_proc > 0 and processos_validos[n_proc - 1].id_global != str(progresso.get("ultimo_id_global", "")).strip():
+        return None
+    return {
+        "n_processos_concluidos": n_proc,
+        "ultimo_id_global": str(progresso.get("ultimo_id_global", "")),
+        "tripletos_salvos": n_trip,
+        "byte_offset": offset,
+        "n_chunks_corpus": n_chunks,
+    }
+
+
+def _cortar_jsonl(caminho: Path, byte_offset: int) -> None:
+    # Descarta o processo gravado pela metade. O byte_offset e o inicio daquela linha.
+    with caminho.open("r+b") as arquivo:
+        arquivo.truncate(max(0, int(byte_offset)))
+
+
+def _apagar_saida_tripletos(saida: Path) -> None:
+    sidecar = _caminho_sidecar_progresso(saida)
+    if saida.is_file():
+        saida.unlink()
+    if sidecar.is_file():
+        sidecar.unlink()
+
+
+def _id_global_da_linha(linha: bytes) -> str | None:
+    # Regex primeiro: a linha do tripleto tem ementa e seis textos. json.loads e o plano B.
+    achado = _RE_ID_GLOBAL.search(linha)
+    if achado:
+        return achado.group(1).decode("ascii", errors="ignore") or None
+    texto = linha.decode("utf-8", errors="ignore").strip()
+    if not texto:
+        return None
+    try:
+        dado = json.loads(texto)
+    except json.JSONDecodeError:
+        return None
+    valor = str(dado.get("id_global") or "").strip()
+    return valor or None
+
+
+def _varrer_jsonl_existente(saida: Path, n_chunks_corpus: int) -> dict[str, Any]:
+    """Le o JSONL sem sidecar. Descarta o ultimo processo, que pode estar incompleto."""
+    tamanho = saida.stat().st_size
+    inicio_ultimo = 0
+    ultimo_id = ""
+    id_anterior = ""
+    n_processos_completos = 0
+    n_tripletos_completos = 0
+    n_tripletos_ultimo = 0
+    offset = 0
+
+    with saida.open("rb") as arquivo, tqdm(
+        total=tamanho,
+        desc="Lendo tripletos ja gravados",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as barra:
+        for linha in arquivo:
+            if not linha.strip():
+                offset += len(linha)
+                barra.update(len(linha))
+                continue
+            identificador = _id_global_da_linha(linha)
+            if identificador is None:
+                # Linha quebrada no fim do arquivo: para no comeco desta linha.
+                break
+            if identificador != ultimo_id:
+                if ultimo_id:
+                    n_processos_completos += 1
+                    n_tripletos_completos += n_tripletos_ultimo
+                    id_anterior = ultimo_id
+                inicio_ultimo = offset
+                ultimo_id = identificador
+                n_tripletos_ultimo = 0
+            n_tripletos_ultimo += 1
+            offset += len(linha)
+            barra.update(len(linha))
+
+    # Sem sidecar nao da para saber se o ultimo processo terminou. Ele e refeito.
+    _cortar_jsonl(saida, inicio_ultimo)
+    return {
+        "n_processos_concluidos": n_processos_completos,
+        "ultimo_id_global": id_anterior,
+        "tripletos_salvos": n_tripletos_completos,
+        "byte_offset": inicio_ultimo,
+        "n_chunks_corpus": int(n_chunks_corpus),
+    }
+
+
+def _indice_apos_processo(
+    processos_validos: list[ProcessoJudicial],
+    ultimo_id: str,
+) -> int:
+    """Indice do proximo processo depois de ultimo_id. 0 se a lista ainda nao comecou.
+    Nao usa a contagem de linhas: processo sem 5 negativos nao aparece no JSONL.
+    """
+    if not ultimo_id:
+        return 0
+    for indice, proc in enumerate(processos_validos):
+        if proc.id_global == ultimo_id:
+            return indice + 1
+    return -1
+
+
+def _progresso_bate_com_corpus(
+    progresso: dict[str, Any],
+    processos_validos: list[ProcessoJudicial],
+) -> bool:
+    n_proc = int(progresso["n_processos_concluidos"])
+    if n_proc < 0 or n_proc > len(processos_validos):
+        return False
+    if n_proc > 0 and processos_validos[n_proc - 1].id_global != progresso["ultimo_id_global"]:
+        return False
+    return True
+
+
+def _preparar_saida_tripletos(
+    saida: Path,
+    n_chunks_corpus: int,
+    processos_validos: list[ProcessoJudicial],
+    retomar: bool,
+) -> dict[str, Any]:
+    """
+    Decide se a busca recomeça, retoma pelo sidecar ou varre o JSONL antigo.
+    Devolve n_processos_concluidos para o laco pular o que ja esta no disco.
+    """
+    sidecar = _caminho_sidecar_progresso(saida)
+    if not retomar:
+        print("Recalculo de tripletos solicitado. Arquivo anterior sera apagado.")
+        _apagar_saida_tripletos(saida)
+        saida.touch()
+        progresso = _progresso_vazio(n_chunks_corpus)
+        _gravar_progresso(sidecar, progresso)
+        return progresso
+
+    if saida.is_file() and saida.stat().st_size > 0:
+        progresso = _progresso_compativel(
+            _ler_progresso(sidecar), saida, n_chunks_corpus, processos_validos
+        )
+        if progresso is not None:
+            sobra = saida.stat().st_size - progresso["byte_offset"]
+            if sobra > 0:
+                print(f"Retomando tripletos: cortando {sobra:,} bytes incompletos.")
+            _cortar_jsonl(saida, progresso["byte_offset"])
+            print(
+                f"Retomando busca: {progresso['n_processos_concluidos']:,} processos ja gravados, "
+                f"{progresso['tripletos_salvos']:,} tripletos no disco."
+            )
+            return progresso
+
+        print("Sidecar ausente ou incompativel. Varrendo train_triplets.jsonl para retomar...")
+        progresso = _varrer_jsonl_existente(saida, n_chunks_corpus)
+        # Processos sem 5 negativos nao entram no JSONL. O indice vem do id, nao da contagem de linhas.
+        indice = _indice_apos_processo(processos_validos, progresso["ultimo_id_global"])
+        if indice < 0:
+            print("Aviso: o ultimo processo do JSONL nao esta no corpus atual. Recomecando a busca.")
+            _apagar_saida_tripletos(saida)
+            saida.touch()
+            progresso = _progresso_vazio(n_chunks_corpus)
+            _gravar_progresso(sidecar, progresso)
+            return progresso
+        progresso["n_processos_concluidos"] = indice
+        if not _progresso_bate_com_corpus(progresso, processos_validos):
+            print("Aviso: a ordem dos processos no JSONL nao bate com o corpus. Recomecando a busca.")
+            _apagar_saida_tripletos(saida)
+            saida.touch()
+            progresso = _progresso_vazio(n_chunks_corpus)
+            _gravar_progresso(sidecar, progresso)
+            return progresso
+        _gravar_progresso(sidecar, progresso)
+        print(
+            f"Retomando busca: {progresso['n_processos_concluidos']:,} processos ja gravados, "
+            f"{progresso['tripletos_salvos']:,} tripletos no disco."
+        )
+        return progresso
+
+    saida.touch()
+    progresso = _progresso_vazio(n_chunks_corpus)
+    _gravar_progresso(sidecar, progresso)
+    return progresso
+
+
+def _posicao_bytes(arquivo) -> int:
+    # tell() no buffer binario e o offset real. fsync grava o lote antes do sidecar.
+    arquivo.flush()
+    buffer = getattr(arquivo, "buffer", None)
+    alvo = buffer if buffer is not None else arquivo
+    try:
+        os.fsync(alvo.fileno())
+    except OSError:
+        pass
+    return int(alvo.tell())
 
 
 def minerar_tripletos_contrastivos(
@@ -408,6 +693,7 @@ def minerar_tripletos_contrastivos(
     arquivo_embeddings: Path | str | None = None,
     recomputar_embeddings: bool = False,
     dispositivos: list[str] | None = None,
+    retomar: bool = True,
 ) -> dict[str, Any]:
     """
     Executa a mineracao em lote de tripletos.
@@ -417,6 +703,8 @@ def minerar_tripletos_contrastivos(
     - Mascaramento In-Place: Anulação imediata de candidatos pertencentes ao mesmo processo diretamente na memoria da GPU.
     - Mitigacao de Gargalo de I/O: Execucao do torch.topk diretamente na GPU. Apenas os indices estritamente necessarios sao transferidos para a CPU.
     - Avaliacao Focada: O calculo da similaridade de cosseno contra o texto positivo (ancora) e restrito ao subconjunto Top-K.
+    - Vetores do ranking: candidatos e positivos saem da matriz na GPU, sem reler o .npy.
+    - Retomada: o JSONL e aberto em append. O sidecar guarda o ultimo processo completo.
     """
     saida = Path(arquivo_saida)
     saida.parent.mkdir(parents=True, exist_ok=True)
@@ -448,6 +736,31 @@ def minerar_tripletos_contrastivos(
         dispositivos=dispositivos,
     )
 
+    # 2b. Retomada: corta linha incompleta e devolve de qual processo seguir.
+    progresso = _preparar_saida_tripletos(
+        saida=saida,
+        n_chunks_corpus=total_chunks,
+        processos_validos=processos_validos,
+        retomar=retomar,
+    )
+    inicio = int(progresso["n_processos_concluidos"])
+    caminho_progresso = _caminho_sidecar_progresso(saida)
+
+    stats = {
+        "processos_avaliados": inicio,
+        "processos_pulados": inicio,
+        "tripletos_salvos": int(progresso["tripletos_salvos"]),
+        "tripletos_ja_gravados": int(progresso["tripletos_salvos"]),
+        "tripletos_novos": 0,
+        "chunks_positivos_avaliados": 0,
+        "chunks_sem_negativos_suficientes": 0,
+        "media_margem_tripletos": 0.0,
+    }
+
+    if inicio >= len(processos_validos):
+        print("Todos os processos ja estao no JSONL. Busca ignorada.")
+        return stats
+
     usar_duas_gpus = bool(dispositivos and len(dispositivos) >= 2)
     shards: list[tuple[int, torch.Tensor]] | None = None
     if usar_duas_gpus:
@@ -458,152 +771,170 @@ def minerar_tripletos_contrastivos(
         print(f"Transferindo matriz de embeddings {tuple(corpus_embs_cpu.shape)} para {device} em {dtype_tensor}...")
         corpus_embs_gpu = torch.from_numpy(corpus_embs_cpu).to(device=device, dtype=dtype_tensor)
 
-    stats = {
-        "processos_avaliados": 0,
-        "tripletos_salvos": 0,
-        "chunks_positivos_avaliados": 0,
-        "chunks_sem_negativos_suficientes": 0,
-        "media_margem_tripletos": 0.0,
-    }
-
     soma_margens = 0.0
+    # top_k do YAML e 200; busca o dobro para a faixa 0.60-0.85 ainda ter 5 negativos.
     k_candidatos_gpu = min(max(top_k * 2, n_negativos * 10), total_chunks)
 
-    # 3. Processamento em lote das consultas
-    with saida.open("w", encoding="utf-8") as f_out:
-        for start in tqdm(range(0, len(processos_validos), query_batch_size), desc="Minerando Tripletos (GPU Otimizada)"):
-            batch_procs = processos_validos[start : start + query_batch_size]
-            queries_formatadas = [
-                preparar_query_com_instrucao(p.ementa, query_instruction)
-                for p in batch_procs
-            ]
+    # 3. Processamento em lote das consultas. Append preserva o que ja estava no disco.
+    with saida.open("a", encoding="utf-8", newline="\n") as f_out:
+        with tqdm(
+            total=len(processos_validos),
+            initial=inicio,
+            desc="Minerando Tripletos (GPU Otimizada)",
+            unit="proc",
+        ) as barra:
+            for start in range(inicio, len(processos_validos), query_batch_size):
+                batch_procs = processos_validos[start : start + query_batch_size]
+                queries_formatadas = [
+                    preparar_query_com_instrucao(p.ementa, query_instruction)
+                    for p in batch_procs
+                ]
 
-            with torch.no_grad():
-                # Vetorizacao em lote das consultas
-                q_embs_gpu = modelo.encode(
-                    queries_formatadas,
-                    batch_size=encode_batch_size,
-                    normalize_embeddings=True,
-                    convert_to_tensor=True,
-                    show_progress_bar=False,
-                ).to(dtype=dtype_tensor, device=device)
+                with torch.no_grad():
+                    # Vetorizacao em lote das consultas
+                    q_embs_gpu = modelo.encode(
+                        queries_formatadas,
+                        batch_size=encode_batch_size,
+                        normalize_embeddings=True,
+                        convert_to_tensor=True,
+                        show_progress_bar=False,
+                    ).to(dtype=dtype_tensor, device=device)
 
-                # Duas placas: top-k em cada metade e juncao. Uma placa: a matriz inteira, como antes.
-                if shards is not None:
-                    partes_scores = []
-                    partes_indices = []
-                    for offset, matriz in shards:
-                        scores_fatia, indices_fatia = _topk_numa_fatia(
-                            q_embs=q_embs_gpu,
-                            matriz=matriz,
-                            offset=offset,
-                            batch_procs=batch_procs,
-                            indices_por_processo=indices_por_processo,
-                            k=k_candidatos_gpu,
-                            dtype_tensor=dtype_tensor,
+                    # Duas placas: top-k em cada metade e juncao. Uma placa: a matriz inteira, como antes.
+                    if shards is not None:
+                        partes_scores = []
+                        partes_indices = []
+                        for offset, matriz in shards:
+                            scores_fatia, indices_fatia = _topk_numa_fatia(
+                                q_embs=q_embs_gpu,
+                                matriz=matriz,
+                                offset=offset,
+                                batch_procs=batch_procs,
+                                indices_por_processo=indices_por_processo,
+                                k=k_candidatos_gpu,
+                                dtype_tensor=dtype_tensor,
+                            )
+                            partes_scores.append(scores_fatia)
+                            partes_indices.append(indices_fatia)
+                        top_scores_cpu, top_indices_cpu = _juntar_topk(
+                            partes_scores, partes_indices, k_candidatos_gpu
                         )
-                        partes_scores.append(scores_fatia)
-                        partes_indices.append(indices_fatia)
-                    top_scores_cpu, top_indices_cpu = _juntar_topk(
-                        partes_scores, partes_indices, k_candidatos_gpu
+                    else:
+                        # Multiplicacao de matrizes em lote na GPU
+                        sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
+
+                        # Mascara chunks do mesmo processo judicial diretamente na GPU
+                        for i_local, proc in enumerate(batch_procs):
+                            pos_idx_list = indices_por_processo[proc.id_global]
+                            sims_batch_gpu[i_local, pos_idx_list] = -1e9
+
+                        # Top-K direto na GPU: extrai apenas os candidatos mais proximos
+                        top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
+
+                        # Transfere para CPU apenas os indices e scores necessarios (array compacto)
+                        top_scores_cpu = top_scores_gpu.cpu().float().numpy()
+                        top_indices_cpu = top_indices_gpu.cpu().numpy()
+
+                # Processamento dos candidatos. Vetores vêm da GPU, nao do .npy.
+                for i_local, proc in enumerate(batch_procs):
+                    stats["processos_avaliados"] += 1
+                    pos_indices = indices_por_processo[proc.id_global]
+
+                    cands_idx = top_indices_cpu[i_local]
+                    cands_score_q = top_scores_cpu[i_local]
+
+                    # Filtra candidatos na faixa [limiar_min, limiar_max]
+                    candidatos_validos = []
+                    for c_idx, score_q in zip(cands_idx, cands_score_q):
+                        if limiar_min <= score_q <= limiar_max:
+                            candidatos_validos.append((int(c_idx), float(score_q)))
+
+                    if len(candidatos_validos) < n_negativos:
+                        stats["chunks_sem_negativos_suficientes"] += len(pos_indices)
+                        continue
+
+                    cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
+                    cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
+                    pos_indices_array = np.array(pos_indices, dtype=np.int64)
+                    cand_embs_gpu = _coletar_linhas_do_corpus(
+                        cand_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
                     )
-                else:
-                    # Multiplicacao de matrizes em lote na GPU: (B, D) x (D, N) -> Shape (B, N)
-                    sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
+                    pos_embs_gpu = _coletar_linhas_do_corpus(
+                        pos_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
+                    )
+                    cand_embs_f32 = cand_embs_gpu.float()
+                    pos_embs_f32 = pos_embs_gpu.float()
+                    # (n_pos, n_cand) e (n_pos,): so os vetores deste processo, ja na GPU.
+                    sims_p_mat = torch.matmul(pos_embs_f32, cand_embs_f32.T).cpu().numpy()
+                    scores_pos_vec = torch.matmul(
+                        pos_embs_f32, q_embs_gpu[i_local].float()
+                    ).cpu().numpy()
 
-                    # Mascara chunks do mesmo processo judicial diretamente na GPU
-                    for i_local, proc in enumerate(batch_procs):
-                        pos_idx_list = indices_por_processo[proc.id_global]
-                        sims_batch_gpu[i_local, pos_idx_list] = -1e9
+                    for j_pos, pos_idx in enumerate(pos_indices):
+                        ch_positivo = chunks_corpus[pos_idx]
 
-                    # Top-K direto na GPU: extrai apenas os candidatos mais proximos
-                    top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
+                        # Filtro do Chunk 0: evita usar cabeçalho se houver outros chunks limpos
+                        if (
+                            ignorar_chunk_0_como_positivo
+                            and ch_positivo.contem_vazamento_ementa
+                            and len(pos_indices) > 1
+                        ):
+                            continue
 
-                    # Transfere para CPU apenas os indices e scores necessarios (array compacto)
-                    top_scores_cpu = top_scores_gpu.cpu().float().numpy()
-                    top_indices_cpu = top_indices_gpu.cpu().numpy()
+                        stats["chunks_positivos_avaliados"] += 1
 
-                q_embs_cpu = q_embs_gpu.cpu().float().numpy()
+                        sims_p_array = sims_p_mat[j_pos]
 
-            # Processamento rapido dos candidatos selecionados
-            for i_local, proc in enumerate(batch_procs):
-                stats["processos_avaliados"] += 1
-                pos_indices = indices_por_processo[proc.id_global]
-                q_emb_vec = q_embs_cpu[i_local]
+                        # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
+                        ordem = np.lexsort((cand_scores_q_array, sims_p_array))[::-1][:n_negativos]
 
-                cands_idx = top_indices_cpu[i_local]
-                cands_score_q = top_scores_cpu[i_local]
+                        if len(ordem) < n_negativos:
+                            stats["chunks_sem_negativos_suficientes"] += 1
+                            continue
 
-                # Filtra candidatos na faixa [limiar_min, limiar_max]
-                candidatos_validos = []
-                for c_idx, score_q in zip(cands_idx, cands_score_q):
-                    if limiar_min <= score_q <= limiar_max:
-                        candidatos_validos.append((int(c_idx), float(score_q)))
+                        neg_indices_finais = cand_indices_array[ordem]
+                        neg_scores_finais = [round(float(s), 4) for s in cand_scores_q_array[ordem]]
+                        neg_textos = [textos_corpus[idx] for idx in neg_indices_finais]
+                        neg_ids = [chunks_corpus[idx].chunk_id for idx in neg_indices_finais]
 
-                if len(candidatos_validos) < n_negativos:
-                    stats["chunks_sem_negativos_suficientes"] += len(pos_indices)
-                    continue
+                        score_pos = round(float(scores_pos_vec[j_pos]), 4)
+                        margem = round(score_pos - max(neg_scores_finais), 4)
 
-                cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
-                cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
-                cand_embs_mat = np.asarray(corpus_embs_cpu[cand_indices_array], dtype=np.float32)
+                        registro = {
+                            "id_global": proc.id_global,
+                            "str_tribunal": proc.tribunal,
+                            "str_numero_unico": proc.numero_processo,
+                            "query": proc.ementa,
+                            "positive": ch_positivo.texto,
+                            "positive_chunk_id": ch_positivo.chunk_id,
+                            "positive_chunk_idx": ch_positivo.chunk_idx,
+                            "negatives": neg_textos,
+                            "negative_chunk_ids": neg_ids,
+                            "score_positive": score_pos,
+                            "scores_negativos": neg_scores_finais,
+                            "margin": margem,
+                        }
 
-                for pos_idx in pos_indices:
-                    ch_positivo = chunks_corpus[pos_idx]
+                        f_out.write(json.dumps(registro, ensure_ascii=False) + "\n")
+                        stats["tripletos_salvos"] += 1
+                        stats["tripletos_novos"] += 1
+                        soma_margens += margem
 
-                    # Filtro do Chunk 0: evita usar cabeçalho se houver outros chunks limpos
-                    if (
-                        ignorar_chunk_0_como_positivo
-                        and ch_positivo.contem_vazamento_ementa
-                        and len(pos_indices) > 1
-                    ):
-                        continue
+                # Processo so entra no sidecar depois do lote inteiro gravado e com flush.
+                _gravar_progresso(
+                    caminho_progresso,
+                    {
+                        "n_processos_concluidos": start + len(batch_procs),
+                        "ultimo_id_global": batch_procs[-1].id_global,
+                        "tripletos_salvos": stats["tripletos_salvos"],
+                        "byte_offset": _posicao_bytes(f_out),
+                        "n_chunks_corpus": total_chunks,
+                    },
+                )
+                barra.update(len(batch_procs))
+                # Sem empty_cache: modelo e fatias ficam na GPU. O alocador reaproveita o cache.
 
-                    stats["chunks_positivos_avaliados"] += 1
-
-                    pos_emb_vec = np.asarray(corpus_embs_cpu[pos_idx], dtype=np.float32)
-
-                    # Similaridade de cosseno com o positivo apenas sobre os candidatos: (K,)
-                    sims_p_array = np.dot(cand_embs_mat, pos_emb_vec)
-
-                    # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
-                    ordem = np.lexsort((cand_scores_q_array, sims_p_array))[::-1][:n_negativos]
-
-                    if len(ordem) < n_negativos:
-                        stats["chunks_sem_negativos_suficientes"] += 1
-                        continue
-
-                    neg_indices_finais = cand_indices_array[ordem]
-                    neg_scores_finais = [round(float(s), 4) for s in cand_scores_q_array[ordem]]
-                    neg_textos = [textos_corpus[idx] for idx in neg_indices_finais]
-                    neg_ids = [chunks_corpus[idx].chunk_id for idx in neg_indices_finais]
-
-                    # Calcula score exato da query com o positivo
-                    score_pos = round(float(np.dot(q_emb_vec, pos_emb_vec)), 4)
-                    margem = round(score_pos - max(neg_scores_finais), 4)
-
-                    registro = {
-                        "id_global": proc.id_global,
-                        "str_tribunal": proc.tribunal,
-                        "str_numero_unico": proc.numero_processo,
-                        "query": proc.ementa,
-                        "positive": ch_positivo.texto,
-                        "positive_chunk_id": ch_positivo.chunk_id,
-                        "positive_chunk_idx": ch_positivo.chunk_idx,
-                        "negatives": neg_textos,
-                        "negative_chunk_ids": neg_ids,
-                        "score_positive": score_pos,
-                        "scores_negativos": neg_scores_finais,
-                        "margin": margem,
-                    }
-
-                    f_out.write(json.dumps(registro, ensure_ascii=False) + "\n")
-                    stats["tripletos_salvos"] += 1
-                    soma_margens += margem
-
-            _esvaziar_cache(shards, device)
-
-    if stats["tripletos_salvos"] > 0:
-        stats["media_margem_tripletos"] = round(soma_margens / stats["tripletos_salvos"], 4)
+    if stats["tripletos_novos"] > 0:
+        stats["media_margem_tripletos"] = round(soma_margens / stats["tripletos_novos"], 4)
 
     return stats
