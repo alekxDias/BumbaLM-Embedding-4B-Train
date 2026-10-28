@@ -210,7 +210,7 @@ A cada execucao do pipeline sao produzidos relatorios rastreaveis para composica
 
 ## TJMA com HN vs sem HN vs baseline
 
-Na branch `exp/ft-sem-hard-negatives`, o `config_base.yaml` usa **apenas TJMA** e a pasta `data/processed_tjma_`. Refaca o experimento do zero:
+Na branch `exp/ft-sem-hard-negatives`, o `config_base.yaml` usa **apenas TJMA** e a pasta `data/processed_tjma`. Refaca o experimento do zero:
 
 ```bash
 # 1) Dados uma vez (split + chunk com anti-vazamento)
