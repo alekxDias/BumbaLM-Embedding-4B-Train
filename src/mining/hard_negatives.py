@@ -784,21 +784,21 @@ def minerar_tripletos_contrastivos(
             unit="proc",
         ) as barra:
             for start in range(inicio, len(processos_validos), query_batch_size):
-            batch_procs = processos_validos[start : start + query_batch_size]
-            queries_formatadas = [
-                preparar_query_com_instrucao(p.ementa, query_instruction)
-                for p in batch_procs
-            ]
+                batch_procs = processos_validos[start : start + query_batch_size]
+                queries_formatadas = [
+                    preparar_query_com_instrucao(p.ementa, query_instruction)
+                    for p in batch_procs
+                ]
 
-            with torch.no_grad():
-                # Vetorizacao em lote das consultas
-                q_embs_gpu = modelo.encode(
-                    queries_formatadas,
-                    batch_size=encode_batch_size,
-                    normalize_embeddings=True,
-                    convert_to_tensor=True,
-                    show_progress_bar=False,
-                ).to(dtype=dtype_tensor, device=device)
+                with torch.no_grad():
+                    # Vetorizacao em lote das consultas
+                    q_embs_gpu = modelo.encode(
+                        queries_formatadas,
+                        batch_size=encode_batch_size,
+                        normalize_embeddings=True,
+                        convert_to_tensor=True,
+                        show_progress_bar=False,
+                    ).to(dtype=dtype_tensor, device=device)
 
                     # Duas placas: top-k em cada metade e juncao. Uma placa: a matriz inteira, como antes.
                     if shards is not None:
@@ -821,40 +821,40 @@ def minerar_tripletos_contrastivos(
                         )
                     else:
                         # Multiplicacao de matrizes em lote na GPU
-                sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
+                        sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
 
-                # Mascara chunks do mesmo processo judicial diretamente na GPU
-                for i_local, proc in enumerate(batch_procs):
-                    pos_idx_list = indices_por_processo[proc.id_global]
-                    sims_batch_gpu[i_local, pos_idx_list] = -1e9
+                        # Mascara chunks do mesmo processo judicial diretamente na GPU
+                        for i_local, proc in enumerate(batch_procs):
+                            pos_idx_list = indices_por_processo[proc.id_global]
+                            sims_batch_gpu[i_local, pos_idx_list] = -1e9
 
-                # Top-K direto na GPU: extrai apenas os candidatos mais proximos
-                top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
+                        # Top-K direto na GPU: extrai apenas os candidatos mais proximos
+                        top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
 
-                # Transfere para CPU apenas os indices e scores necessarios (array compacto)
-                top_scores_cpu = top_scores_gpu.cpu().float().numpy()
-                top_indices_cpu = top_indices_gpu.cpu().numpy()
+                        # Transfere para CPU apenas os indices e scores necessarios (array compacto)
+                        top_scores_cpu = top_scores_gpu.cpu().float().numpy()
+                        top_indices_cpu = top_indices_gpu.cpu().numpy()
 
                 # Processamento dos candidatos. Vetores vêm da GPU, nao do .npy.
-            for i_local, proc in enumerate(batch_procs):
-                stats["processos_avaliados"] += 1
-                pos_indices = indices_por_processo[proc.id_global]
+                for i_local, proc in enumerate(batch_procs):
+                    stats["processos_avaliados"] += 1
+                    pos_indices = indices_por_processo[proc.id_global]
 
-                cands_idx = top_indices_cpu[i_local]
-                cands_score_q = top_scores_cpu[i_local]
+                    cands_idx = top_indices_cpu[i_local]
+                    cands_score_q = top_scores_cpu[i_local]
 
-                # Filtra candidatos na faixa [limiar_min, limiar_max]
-                candidatos_validos = []
-                for c_idx, score_q in zip(cands_idx, cands_score_q):
-                    if limiar_min <= score_q <= limiar_max:
-                        candidatos_validos.append((int(c_idx), float(score_q)))
+                    # Filtra candidatos na faixa [limiar_min, limiar_max]
+                    candidatos_validos = []
+                    for c_idx, score_q in zip(cands_idx, cands_score_q):
+                        if limiar_min <= score_q <= limiar_max:
+                            candidatos_validos.append((int(c_idx), float(score_q)))
 
-                if len(candidatos_validos) < n_negativos:
-                    stats["chunks_sem_negativos_suficientes"] += len(pos_indices)
-                    continue
+                    if len(candidatos_validos) < n_negativos:
+                        stats["chunks_sem_negativos_suficientes"] += len(pos_indices)
+                        continue
 
-                cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
-                cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
+                    cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
+                    cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
                     pos_indices_array = np.array(pos_indices, dtype=np.int64)
                     cand_embs_gpu = _coletar_linhas_do_corpus(
                         cand_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
@@ -871,54 +871,54 @@ def minerar_tripletos_contrastivos(
                     ).cpu().numpy()
 
                     for j_pos, pos_idx in enumerate(pos_indices):
-                    ch_positivo = chunks_corpus[pos_idx]
+                        ch_positivo = chunks_corpus[pos_idx]
 
-                    # Filtro do Chunk 0: evita usar cabeçalho se houver outros chunks limpos
-                    if (
-                        ignorar_chunk_0_como_positivo
-                        and ch_positivo.contem_vazamento_ementa
-                        and len(pos_indices) > 1
-                    ):
-                        continue
+                        # Filtro do Chunk 0: evita usar cabeçalho se houver outros chunks limpos
+                        if (
+                            ignorar_chunk_0_como_positivo
+                            and ch_positivo.contem_vazamento_ementa
+                            and len(pos_indices) > 1
+                        ):
+                            continue
 
-                    stats["chunks_positivos_avaliados"] += 1
+                        stats["chunks_positivos_avaliados"] += 1
 
                         sims_p_array = sims_p_mat[j_pos]
 
-                    # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
-                    ordem = np.lexsort((cand_scores_q_array, sims_p_array))[::-1][:n_negativos]
+                        # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
+                        ordem = np.lexsort((cand_scores_q_array, sims_p_array))[::-1][:n_negativos]
 
-                    if len(ordem) < n_negativos:
-                        stats["chunks_sem_negativos_suficientes"] += 1
-                        continue
+                        if len(ordem) < n_negativos:
+                            stats["chunks_sem_negativos_suficientes"] += 1
+                            continue
 
-                    neg_indices_finais = cand_indices_array[ordem]
-                    neg_scores_finais = [round(float(s), 4) for s in cand_scores_q_array[ordem]]
-                    neg_textos = [textos_corpus[idx] for idx in neg_indices_finais]
-                    neg_ids = [chunks_corpus[idx].chunk_id for idx in neg_indices_finais]
+                        neg_indices_finais = cand_indices_array[ordem]
+                        neg_scores_finais = [round(float(s), 4) for s in cand_scores_q_array[ordem]]
+                        neg_textos = [textos_corpus[idx] for idx in neg_indices_finais]
+                        neg_ids = [chunks_corpus[idx].chunk_id for idx in neg_indices_finais]
 
                         score_pos = round(float(scores_pos_vec[j_pos]), 4)
-                    margem = round(score_pos - max(neg_scores_finais), 4)
+                        margem = round(score_pos - max(neg_scores_finais), 4)
 
-                    registro = {
-                        "id_global": proc.id_global,
-                        "str_tribunal": proc.tribunal,
-                        "str_numero_unico": proc.numero_processo,
-                        "query": proc.ementa,
-                        "positive": ch_positivo.texto,
-                        "positive_chunk_id": ch_positivo.chunk_id,
-                        "positive_chunk_idx": ch_positivo.chunk_idx,
-                        "negatives": neg_textos,
-                        "negative_chunk_ids": neg_ids,
-                        "score_positive": score_pos,
-                        "scores_negativos": neg_scores_finais,
-                        "margin": margem,
-                    }
+                        registro = {
+                            "id_global": proc.id_global,
+                            "str_tribunal": proc.tribunal,
+                            "str_numero_unico": proc.numero_processo,
+                            "query": proc.ementa,
+                            "positive": ch_positivo.texto,
+                            "positive_chunk_id": ch_positivo.chunk_id,
+                            "positive_chunk_idx": ch_positivo.chunk_idx,
+                            "negatives": neg_textos,
+                            "negative_chunk_ids": neg_ids,
+                            "score_positive": score_pos,
+                            "scores_negativos": neg_scores_finais,
+                            "margin": margem,
+                        }
 
-                    f_out.write(json.dumps(registro, ensure_ascii=False) + "\n")
-                    stats["tripletos_salvos"] += 1
+                        f_out.write(json.dumps(registro, ensure_ascii=False) + "\n")
+                        stats["tripletos_salvos"] += 1
                         stats["tripletos_novos"] += 1
-                    soma_margens += margem
+                        soma_margens += margem
 
                 # Processo so entra no sidecar depois do lote inteiro gravado e com flush.
                 _gravar_progresso(
