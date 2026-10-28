@@ -1,4 +1,5 @@
 # Configuracoes Gerais e de Caminhos - Pipeline BumbaLM-Embedding-4B
+# Branch exp/ft-sem-hard-negatives: com HN vs sem HN vs baseline
 
 projeto:
   nome: "BumbaLM-Embedding-4B-Train"
@@ -9,26 +10,24 @@ projeto:
 # Caminhos dos Dados
 dados:
   diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
-  diretorio_processados: "data/processed_2gpu"
+  # Pasta nova para nao misturar com experimentos multi-tribunal anteriores
+  diretorio_processados: "data/processed_tjma"
   
-  # Lista explicita dos arquivos de pares para processamento.
-  # Comente ou descomente as linhas para incluir ou excluir tribunais:
   arquivos_pares:
-    # --- TRIBUNAIS DE JUSTICA ESTADUAIS (ATIVOS PARA O PRIMEIRO TESTE) ---
-    - "pares_tjba.jsonl"
-    - "pares_tjdf.jsonl"
-    - "pares_tjes.jsonl"
     - "pares_tjma.jsonl"
-    - "pares_tjms.jsonl"
-    - "pares_tjpa.jsonl"
-    - "pares_tjpb.jsonl"
-    - "pares_tjpr.jsonl"
-    - "pares_tjrn.jsonl"
-    - "pares_tjro.jsonl"
-    - "pares_tjrr.jsonl"
-    - "pares_tjrs.jsonl"
 
-    # --- TRIBUNAIS SUPERIORES E ESPECIALIZADOS (DESATIVADOS NESTE TESTE) ---
+    # --- OUTROS TRIBUNAIS ---
+    # - "pares_tjba.jsonl"
+    # - "pares_tjdf.jsonl"
+    # - "pares_tjes.jsonl"
+    # - "pares_tjms.jsonl"
+    # - "pares_tjpa.jsonl"
+    # - "pares_tjpb.jsonl"
+    # - "pares_tjpr.jsonl"
+    # - "pares_tjrn.jsonl"
+    # - "pares_tjro.jsonl"
+    # - "pares_tjrr.jsonl"
+    # - "pares_tjrs.jsonl"
     # - "pares_stf.jsonl"
     # - "pares_tst.jsonl"
     # - "pares_tse.jsonl"
@@ -44,7 +43,8 @@ dados:
     inteiro_teor: "str_inteiro_teor"  # Coluna com o texto integral da decisao
 
 # Diretorios de Saida de Modelos e Logs
+# Use --output_dir no pipeline para separar com_hn e sem_hn.
 saidas:
   diretorio_experimentos: "experiments"
-  nome_experimento: "exp_003_h200_4b_2gpu"
+  nome_experimento: "exp_tjma_com_hn"
   hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"

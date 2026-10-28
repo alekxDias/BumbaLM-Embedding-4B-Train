@@ -3,7 +3,7 @@
 hardware:
   # Vazio: uma GPU. "1": somente a segunda placa.
   # "0,1": treino em DDP e mineracao nas duas placas.
-  gpus: "0,1"
+  gpus: "0"
 
 modelo:
   model_id: "Qwen/Qwen3-Embedding-4B"

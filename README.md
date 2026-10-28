@@ -205,3 +205,22 @@ A cada execucao do pipeline sao produzidos relatorios rastreaveis para composica
 | `telemetria_execucao.csv` | `experiments/<exp>/` | Metricas step a step. |
 | `comparativo_test.txt` | `experiments/<exp>/avaliacoes/` | Tabela comparativa de metricas de IR (Baseline vs. BumbaLM Treinado). |
 | `avaliacao_consolidada.json` | `experiments/<exp>/avaliacoes/` | Metricas globais e segmentadas por tribunal em formato estruturado. |
+
+---
+
+## TJMA com HN vs sem HN vs baseline
+
+Na branch `exp/ft-sem-hard-negatives`, o `config_base.yaml` usa **apenas TJMA** e a pasta `data/processed_tjma_`. Refaca o experimento do zero:
+
+```bash
+# 1) Dados uma vez (split + chunk com anti-vazamento)
+python scripts/run_pipeline.py --steps split,chunk
+
+# 2) Braco B — FT com 5 hard negatives
+python scripts/run_pipeline.py --steps mine,train,eval --gpus 0 --compare_baseline --output_dir experiments/exp_tjma_com_hn
+
+# 3) Braco C — FT sem hard negatives (apenas in-batch)
+python scripts/run_pipeline.py --steps pairs,train,eval --n_negativos 0 --gpus 0 --compare_baseline --output_dir experiments/exp_tjma_sem_hn
+```
+
+A etapa `pairs` gera `train_pairs.jsonl` (ementa + chunk, sem negativos minerados). Com `--n_negativos 0`, a loss usa so negativos do lote. Compare A (baseline), B e C no mesmo teste.

@@ -6,6 +6,7 @@ Permite executar o pipeline completo de ponta a ponta ou etapas especificas:
   - split : 01_prepare_and_split.py (Limpeza e divisao estratificada em Train/Val/Test)
   - chunk : 02_generate_chunks.py (Fragmentacao em janelas de tokens e auditoria de Chunk 0)
   - mine  : 03_mine_negatives.py (Mineracao acelerada em GPU de hard negatives)
+  - pairs : 03b_build_pairs.py (Pares ementa+chunk sem hard negatives; so in-batch)
   - train : 04_train.py (Fine-tuning contrastivo com telemetria cientifica)
   - eval  : 05_evaluate.py (Avaliacao e comparativo com baseline)
 
@@ -36,6 +37,12 @@ Permite executar o pipeline completo de ponta a ponta ou etapas especificas:
 7c. Mineracao nas duas GPUs (vetorizacao e busca repartidas; nao usa torchrun):
    python scripts/run_pipeline.py --steps mine --gpus 0,1
 
+7d. TJMA sem hard negatives (pares + treino in-batch + eval vs baseline):
+   python scripts/run_pipeline.py --steps pairs,train,eval --n_negativos 0 --gpus 0 --output_dir experiments/exp_tjma_sem_hn --compare_baseline
+
+7e. TJMA com hard negatives (mine + treino + eval vs baseline):
+   python scripts/run_pipeline.py --steps mine,train,eval --gpus 0 --output_dir experiments/exp_tjma_com_hn --compare_baseline
+
 8. Apenas avaliacao do modelo salvo contra o modelo baseline zero-shot no conjunto de teste:
    python scripts/run_pipeline.py --steps eval --compare_baseline
 
@@ -58,11 +65,13 @@ ETAPAS_DISPONIVEIS = {
     "split": BASE_DIR / "scripts" / "01_prepare_and_split.py",
     "chunk": BASE_DIR / "scripts" / "02_generate_chunks.py",
     "mine": BASE_DIR / "scripts" / "03_mine_negatives.py",
+    "pairs": BASE_DIR / "scripts" / "03b_build_pairs.py",
     "train": BASE_DIR / "scripts" / "04_train.py",
     "eval": BASE_DIR / "scripts" / "05_evaluate.py",
 }
 
 ORDEM_PADRAO = ["split", "chunk", "mine", "train", "eval"]
+ETAPAS_VALIDAS = list(ETAPAS_DISPONIVEIS.keys())
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         "--steps",
         type=str,
         default=None,
-        help="Lista de etapas separadas por virgula. Opcoes: split, chunk, mine, train, eval.",
+        help="Lista de etapas separadas por virgula. Opcoes: split, chunk, mine, pairs, train, eval.",
     )
     parser.add_argument(
         "--input",
@@ -146,6 +155,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="GPUs das etapas mine e train. Ex.: '1' ou '0,1'.",
     )
+    parser.add_argument(
+        "--n_negativos",
+        type=int,
+        default=None,
+        help="Hard negatives por instancia na etapa train. Use 0 para pares so com in-batch.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        default=None,
+        help="Diretorio do experimento (train) e/ou pasta de relatorios (eval).",
+    )
+    parser.add_argument(
+        "--triplets_file",
+        type=Path,
+        default=None,
+        help="JSONL de treino para a etapa train (triplets ou pairs).",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=Path,
+        default=None,
+        help="Caminho do modelo treinado para a etapa eval.",
+    )
     return parser.parse_args()
 
 
@@ -194,6 +227,7 @@ def main() -> None:
         print("  - Executar todo o pipeline : python scripts/run_pipeline.py --all")
         print("  - Preparar dados e chunks  : python scripts/run_pipeline.py --steps split,chunk")
         print("  - Treinar e avaliar        : python scripts/run_pipeline.py --steps train,eval --compare_baseline")
+        print("  - Sem HN (in-batch): python scripts/run_pipeline.py --steps pairs,train,eval --n_negativos 0 --compare_baseline")
         print("  - Apenas avaliar modelo    : python scripts/run_pipeline.py --steps eval --compare_baseline")
         print("\nPara ver todas as opcoes e exemplos detalhados: python scripts/run_pipeline.py --help\n")
         sys.exit(1)
@@ -204,7 +238,7 @@ def main() -> None:
         etapas_selecionadas = [s.strip().lower() for s in args.steps.split(",") if s.strip()]
         for e in etapas_selecionadas:
             if e not in ETAPAS_DISPONIVEIS:
-                print(f"Erro: Etapa desconhecida '{e}'. Opcoes validas: {', '.join(ORDEM_PADRAO)}")
+                print(f"Erro: Etapa desconhecida '{e}'. Opcoes validas: {', '.join(ETAPAS_VALIDAS)}")
                 sys.exit(1)
 
     python_bin = sys.executable
@@ -235,6 +269,10 @@ def main() -> None:
             if args.gpus:
                 cmd.extend(["--gpus", args.gpus])
 
+        if etapa == "pairs":
+            # Usa diretorio processado do config_base; sem flags obrigatorias.
+            pass
+
         if etapa == "train":
             if args.batch_size:
                 cmd.extend(["--batch_size", str(args.batch_size)])
@@ -248,6 +286,12 @@ def main() -> None:
                 cmd.extend(["--resume_from_checkpoint", str(args.resume_from_checkpoint)])
             if args.gpus:
                 cmd.extend(["--gpus", args.gpus])
+            if args.n_negativos is not None:
+                cmd.extend(["--n_negativos", str(args.n_negativos)])
+            if args.triplets_file is not None:
+                cmd.extend(["--triplets_file", str(args.triplets_file)])
+            if args.output_dir is not None:
+                cmd.extend(["--output_dir", str(args.output_dir)])
 
         if etapa == "eval":
             cmd.extend(["--split", args.eval_split])
@@ -255,6 +299,12 @@ def main() -> None:
                 cmd.append("--compare_baseline")
             if args.batch_size:
                 cmd.extend(["--batch_size", str(args.batch_size)])
+            if args.model_path is not None:
+                cmd.extend(["--model_path", str(args.model_path)])
+            elif args.output_dir is not None:
+                # Se train salvou em --output_dir, eval procura best_model_4b la.
+                cmd.extend(["--model_path", str(Path(args.output_dir) / "best_model_4b")])
+                cmd.extend(["--output_dir", str(Path(args.output_dir) / "avaliacoes")])
 
         sucesso = executar_comando(cmd, etapa)
         if not sucesso:

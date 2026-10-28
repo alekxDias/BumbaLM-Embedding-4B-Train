@@ -8,20 +8,28 @@ import inspect
 import json
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, Features, Value
+from datasets.arrow_writer import ArrowWriter
 from sentence_transformers import SentenceTransformer
 from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
 from sentence_transformers.trainer import SentenceTransformerTrainer
 from sentence_transformers.training_args import BatchSamplers, SentenceTransformerTrainingArguments
+from tqdm import tqdm
 
 from src.training.telemetry import ScientificMetricsCallback
 
 
 log = logging.getLogger("bumbalm_trainer")
+
+# Lotes pequenos na conversao.
+_LOTE_CONVERSAO_ARROW = 2048
+_ESPERA_CACHE_SEGUNDOS = 5.0
 
 
 def _processo_principal() -> bool:
@@ -37,62 +45,298 @@ def _num_processos() -> int:
     return max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
 
+def _garantir_grupo_processo() -> None:
+    """
+    O torchrun define RANK/WORLD_SIZE, mas o process group so nasce no Trainer.
+    Inicia aqui para o barrier funcionar antes da conversao do JSONL.
+    """
+    if _num_processos() <= 1:
+        return
+    if not torch.distributed.is_available():
+        return
+    if torch.distributed.is_initialized():
+        return
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    torch.distributed.init_process_group(backend=backend)
+
+
+def _sincronizar_ranks() -> None:
+    """Espera todos os ranks do DDP. No processo unico nao faz nada."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+
+def _aguardar_cache_tripletos(
+    caminho_jsonl: Path,
+    arrow_path: Path,
+    meta_path: Path,
+    n_negativos: int,
+) -> dict[str, Any]:
+    """Ranks != 0: espera o meta aparecer."""
+    while True:
+        meta = _cache_tripletos_valido(caminho_jsonl, arrow_path, meta_path, n_negativos)
+        if meta is not None:
+            return meta
+        time.sleep(_ESPERA_CACHE_SEGUNDOS)
+
+
+def _assinatura_jsonl(caminho: Path) -> dict[str, int]:
+    stat = caminho.stat()
+    return {
+        "jsonl_size": int(stat.st_size),
+        "jsonl_mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+    }
+
+
+def _caminhos_cache_tripletos(caminho_jsonl: Path) -> tuple[Path, Path, Path]:
+    """Pasta Arrow + arquivo de dados + metadado ao lado do JSONL."""
+    cache_dir = caminho_jsonl.with_name(f"{caminho_jsonl.stem}_dataset")
+    arrow_path = cache_dir / "data.arrow"
+    meta_path = caminho_jsonl.with_name(f"{caminho_jsonl.stem}_dataset.meta.json")
+    return cache_dir, arrow_path, meta_path
+
+
+def _ler_meta_cache(meta_path: Path) -> dict[str, Any] | None:
+    if not meta_path.is_file():
+        return None
+    try:
+        with meta_path.open(encoding="utf-8") as f:
+            dado = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return dado if isinstance(dado, dict) else None
+
+
+def _cache_tripletos_valido(
+    caminho_jsonl: Path,
+    arrow_path: Path,
+    meta_path: Path,
+    n_negativos: int,
+) -> dict[str, Any] | None:
+    """Devolve o meta se o cache Arrow ainda bate com o JSONL atual."""
+    meta = _ler_meta_cache(meta_path)
+    if meta is None or not arrow_path.is_file() or arrow_path.stat().st_size <= 0:
+        return None
+    atual = _assinatura_jsonl(caminho_jsonl)
+    if int(meta.get("jsonl_size", -1)) != atual["jsonl_size"]:
+        return None
+    if int(meta.get("jsonl_mtime_ns", -1)) != atual["jsonl_mtime_ns"]:
+        return None
+    if int(meta.get("n_negativos", -1)) != int(n_negativos):
+        return None
+    if int(meta.get("validos", 0)) <= 0:
+        return None
+    return meta
+
+
+def _gravar_meta_cache(meta_path: Path, meta: dict[str, Any]) -> None:
+    tmp = meta_path.with_suffix(meta_path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    tmp.replace(meta_path)
+
+
+def _iterar_tripletos_treino(
+    caminho: Path,
+    n_negativos: int,
+    query_instruction: str,
+    colunas: list[str],
+    stats: dict[str, int],
+) -> Iterator[dict[str, list[str]]]:
+    """
+    Le o JSONL em streaming e entrega lotes ja no formato da loss.
+    Nao acumula o corpus inteiro em listas Python.
+    """
+    lote: dict[str, list[str]] = {col: [] for col in colunas}
+    tamanho = caminho.stat().st_size
+
+    with caminho.open(encoding="utf-8") as f, tqdm(
+        total=tamanho,
+        desc="Convertendo tripletos para Arrow",
+        unit="B",
+        unit_scale=True,
+        unit_divisor=1024,
+        disable=not _processo_principal(),
+    ) as barra:
+        for linha in f:
+            barra.update(len(linha.encode("utf-8")))
+            linha = linha.strip()
+            if not linha:
+                continue
+            stats["lidos"] += 1
+            try:
+                item = json.loads(linha)
+            except json.JSONDecodeError:
+                stats["descartados"] += 1
+                continue
+
+            query = str(item.get("query", "")).strip()
+            positive = str(item.get("positive", "")).strip()
+            negatives = [str(n).strip() for n in item.get("negatives", []) if str(n).strip()]
+
+            # n_negativos=0: apenas pares (anchor, positive); negativos vêm do batch.
+            if not query or not positive:
+                stats["descartados"] += 1
+                continue
+            if n_negativos > 0 and len(negatives) < n_negativos:
+                stats["descartados"] += 1
+                continue
+
+            anchor_texto = query if query.startswith("Instruct:") else f"{query_instruction}{query}"
+            lote["anchor"].append(anchor_texto)
+            lote["positive"].append(positive)
+            for i in range(n_negativos):
+                lote[f"negative_{i}"].append(negatives[i])
+            stats["validos"] += 1
+
+            if len(lote["anchor"]) >= _LOTE_CONVERSAO_ARROW:
+                yield lote
+                lote = {col: [] for col in colunas}
+
+        if lote["anchor"]:
+            yield lote
+
+
+def _converter_jsonl_para_arrow(
+    caminho: Path,
+    cache_dir: Path,
+    arrow_path: Path,
+    meta_path: Path,
+    n_negativos: int,
+    query_instruction: str,
+) -> dict[str, Any]:
+    """
+    Rank 0: grava data.arrow em lotes e o .meta.json.
+    Usa pasta temporaria e renomeia ao terminar.
+    """
+    colunas = ["anchor", "positive"] + [f"negative_{i}" for i in range(n_negativos)]
+    features = Features({col: Value("large_string") for col in colunas})
+    stats = {"lidos": 0, "validos": 0, "descartados": 0}
+
+    tmp_dir = cache_dir.with_name(cache_dir.name + ".building")
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_arrow = tmp_dir / "data.arrow"
+
+    _imprimir(f"Convertendo JSONL para cache Arrow (streaming): {caminho}")
+    _imprimir(f"Destino temporario: {tmp_dir}")
+
+    try:
+        with ArrowWriter(path=str(tmp_arrow), features=features) as writer:
+            for lote in _iterar_tripletos_treino(
+                caminho=caminho,
+                n_negativos=n_negativos,
+                query_instruction=query_instruction,
+                colunas=colunas,
+                stats=stats,
+            ):
+                writer.write_batch(lote)
+            writer.finalize()
+    except Exception:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    if stats["validos"] == 0:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        if n_negativos > 0:
+            raise ValueError(
+                f"Nenhum tripleto valido com {n_negativos} negativos foi encontrado em {caminho}"
+            )
+        raise ValueError(
+            f"Nenhum par valido (anchor, positive) foi encontrado em {caminho}"
+        )
+
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    tmp_dir.rename(cache_dir)
+
+    meta = {
+        **_assinatura_jsonl(caminho),
+        "n_negativos": int(n_negativos),
+        "lidos": int(stats["lidos"]),
+        "validos": int(stats["validos"]),
+        "descartados": int(stats["descartados"]),
+        "arrow_relpath": "data.arrow",
+    }
+    _gravar_meta_cache(meta_path, meta)
+
+    if not arrow_path.is_file():
+        raise FileNotFoundError(f"Cache Arrow nao foi criado: {arrow_path}")
+
+    _imprimir(
+        f"Cache Arrow gravado: {stats['validos']:,} validos "
+        f"(lidos: {stats['lidos']:,}, descartados: {stats['descartados']:,})"
+    )
+    return meta
+
+
+def _abrir_dataset_arrow(arrow_path: Path) -> Dataset:
+    # from_file usa memory-map: os ranks compartilham o mesmo arquivo no disco.
+    return Dataset.from_file(str(arrow_path))
+
+
 def carregar_dataset_tripletos(
     caminho_arquivo: Path | str,
     n_negativos: int = 5,
     query_instruction: str = "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: ",
 ) -> Dataset:
     """
-    Le o arquivo de tripletos minerados e monta o Dataset HuggingFace estruturado
-    nas colunas exigidas pela CachedMultipleNegativesRankingLoss:
-    ['anchor', 'positive', 'negative_0', ..., 'negative_4']
+    Abre o JSONL no formato da CachedMultipleNegativesRankingLoss.
+
+    - n_negativos > 0: colunas ['anchor', 'positive', 'negative_0', ..., 'negative_{n-1}']
+    - n_negativos = 0: apenas ['anchor', 'positive'] (negativos in-batch)
+
+    Na primeira vez o rank 0 converte o JSONL para Arrow em disco (streaming).
     """
+    if n_negativos < 0:
+        raise ValueError(f"n_negativos deve ser >= 0; recebido: {n_negativos}")
+
     caminho = Path(caminho_arquivo)
     if not caminho.is_file():
-        raise FileNotFoundError(f"Arquivo de tripletos nao encontrado: {caminho}")
+        raise FileNotFoundError(f"Arquivo de tripletos/pares nao encontrado: {caminho}")
 
-    colunas = ["anchor", "positive"] + [f"negative_{i}" for i in range(n_negativos)]
-    dados: dict[str, list[str]] = {col: [] for col in colunas}
+    cache_dir, arrow_path, meta_path = _caminhos_cache_tripletos(caminho)
 
-    lidos = 0
-    validos = 0
-    descartados = 0
+    # Garante barrier real no DDP (o Trainer ainda nao inicializou o grupo).
+    _garantir_grupo_processo()
+    _sincronizar_ranks()
+    meta = _cache_tripletos_valido(caminho, arrow_path, meta_path, n_negativos)
 
-    with caminho.open(encoding="utf-8") as f:
-        for linha in f:
-            linha = linha.strip()
-            if not linha:
-                continue
-            lidos += 1
-            item = json.loads(linha)
+    if meta is None:
+        if _processo_principal():
+            meta = _converter_jsonl_para_arrow(
+                caminho=caminho,
+                cache_dir=cache_dir,
+                arrow_path=arrow_path,
+                meta_path=meta_path,
+                n_negativos=n_negativos,
+                query_instruction=query_instruction,
+            )
+        else:
+            # Sem process group, o barrier seria no-op: espera o arquivo no disco.
+            meta = _aguardar_cache_tripletos(caminho, arrow_path, meta_path, n_negativos)
+        _sincronizar_ranks()
+        meta = _cache_tripletos_valido(caminho, arrow_path, meta_path, n_negativos)
+        if meta is None:
+            raise RuntimeError(
+                f"Falha ao preparar o cache Arrow dos tripletos em {cache_dir}. "
+            )
+    else:
+        _imprimir(
+            f"Reutilizando cache Arrow: {arrow_path} "
+            f"({int(meta['validos']):,} instancias)"
+        )
+        _sincronizar_ranks()
 
-            query = str(item.get("query", "")).strip()
-            positive = str(item.get("positive", "")).strip()
-            negatives = [str(n).strip() for n in item.get("negatives", []) if str(n).strip()]
-
-            if not query or not positive or len(negatives) < n_negativos:
-                descartados += 1
-                continue
-
-            # Aplica a instrucao formal na query se necessario
-            anchor_texto = query if query.startswith("Instruct:") else f"{query_instruction}{query}"
-
-            dados["anchor"].append(anchor_texto)
-            dados["positive"].append(positive)
-            for i in range(n_negativos):
-                dados[f"negative_{i}"].append(negatives[i])
-
-            validos += 1
-
-    if validos == 0:
-        raise ValueError(f"Nenhum tripleto valido com {n_negativos} negativos foi encontrado em {caminho}")
-
-    import pyarrow as pa
-    schema_large = pa.schema([pa.field(col, pa.large_string()) for col in colunas])
-    tabela_arrow = pa.Table.from_pydict(dados, schema=schema_large)
-    dataset = Dataset(tabela_arrow)
-
-    _imprimir(f"Dataset de Treino Carregado: {validos:,} tripletos validos (descartados: {descartados:,})")
+    dataset = _abrir_dataset_arrow(arrow_path)
+    rotulo = "pares" if n_negativos == 0 else "tripletos"
+    _imprimir(
+        f"Dataset de Treino Carregado: {len(dataset):,} {rotulo} validos "
+        f"(n_negativos={n_negativos}, descartados: {int(meta.get('descartados', 0)):,})"
+    )
     return dataset
 
 

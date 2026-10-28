@@ -5,7 +5,7 @@ Pipeline BumbaLM - Etapa 4: Treinamento Contrastivo do Modelo.
 Executa:
 1. Leitura dos hiperparametros de treinamento e hardware ('config_train.yaml').
 2. Construcao da arquitetura do Qwen3-Embedding-4B (Full Fine-Tuning sem LoRA).
-3. Carregamento dos tripletos minerados ('train_triplets.jsonl').
+3. Carregamento dos tripletos minerados ('train_triplets.jsonl') ou pares sem HN ('train_pairs.jsonl').
 4. Configuracao da CachedMultipleNegativesRankingLoss e do SentenceTransformerTrainer.
 5. Execucao do fine-tuning com telemetria cientifica de hardware em tempo real.
 6. Salvamento do melhor modelo consolidado em disco ('best_model_4b/').
@@ -15,6 +15,7 @@ Uso:
     python scripts/04_train.py --gpus 1
     python scripts/04_train.py --gpus 0,1
     python scripts/04_train.py --batch_size 128 --epochs 1
+    python scripts/04_train.py --n_negativos 0 --triplets_file data/processed_tjma/train_pairs.jsonl
 """
 
 from __future__ import annotations
@@ -165,7 +166,13 @@ def parse_args() -> argparse.Namespace:
         "--triplets_file",
         type=Path,
         default=None,
-        help="Caminho do arquivo train_triplets.jsonl gerado na Etapa 3.",
+        help="Caminho do JSONL de treino (train_triplets.jsonl ou train_pairs.jsonl).",
+    )
+    parser.add_argument(
+        "--n_negativos",
+        type=int,
+        default=None,
+        help="Quantidade de hard negatives por instancia. Use 0 para pares so com in-batch. Padrao: 5.",
     )
     parser.add_argument(
         "--output_dir",
@@ -236,12 +243,21 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # Localizacao do arquivo de dados de tripletos
+    # Localizacao do arquivo de dados de tripletos/pares
     dir_processados = Path(cfg_base.get("dados", {}).get("diretorio_processados", "data/processed"))
     if not dir_processados.is_absolute():
         dir_processados = BASE_DIR / dir_processados
 
-    caminho_tripletos = args.triplets_file or (dir_processados / "train_triplets.jsonl")
+    n_negativos = 5 if args.n_negativos is None else int(args.n_negativos)
+    if n_negativos < 0:
+        raise ValueError(f"--n_negativos deve ser >= 0; recebido: {n_negativos}")
+
+    if args.triplets_file is not None:
+        caminho_tripletos = Path(args.triplets_file)
+    elif n_negativos == 0:
+        caminho_tripletos = dir_processados / "train_pairs.jsonl"
+    else:
+        caminho_tripletos = dir_processados / "train_triplets.jsonl"
     if not Path(caminho_tripletos).is_absolute():
         caminho_tripletos = BASE_DIR / caminho_tripletos
 
@@ -284,9 +300,10 @@ def main() -> None:
     num_processos = max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
     _imprimir("=" * 64)
-    _imprimir("BumbaLM - Etapa 4: Treinamento Contrastivo em GPU H200")
+    _imprimir("BumbaLM - Etapa 4: Treinamento Contrastivo")
     _imprimir("=" * 64)
-    _imprimir(f"Arquivo de Tripletos : {caminho_tripletos}")
+    _imprimir(f"Arquivo de Treino    : {caminho_tripletos}")
+    _imprimir(f"Hard negatives (N)   : {n_negativos}" + (" (somente in-batch)" if n_negativos == 0 else ""))
     _imprimir(f"Diretorio de Saida   : {dir_saida}")
     _imprimir(f"Modelo de Base       : {model_id}")
     _imprimir(f"GPUs no passo        : {num_processos} | Dispositivo local: {dispositivo}")
@@ -305,10 +322,10 @@ def main() -> None:
         device=dispositivo,
     )
 
-    # 2. Carregamento do Dataset de Tripletos
+    # 2. Carregamento do Dataset de Tripletos / Pares
     train_dataset = carregar_dataset_tripletos(
         caminho_arquivo=caminho_tripletos,
-        n_negativos=5,
+        n_negativos=n_negativos,
         query_instruction=query_instruction,
     )
 
