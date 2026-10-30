@@ -219,7 +219,7 @@ def main() -> None:
         if args.batch_size is None:
             args.batch_size = 16
         if args.mini_batch_size is None:
-            args.mini_batch_size = 8
+            args.mini_batch_size = 4
         print("=" * 64)
         print("MODO SMOKE TEST ATIVADO: Execucao rapida para validacao do pipeline.")
         print(

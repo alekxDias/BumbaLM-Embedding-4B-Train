@@ -67,17 +67,21 @@ def construir_modelo_embedding(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+    kwargs_para_modelo = {
+        "attn_implementation": attn_implementation if em_cuda else "eager",
+        "torch_dtype": dtype_modelo,
+        "trust_remote_code": True,
+    }
     # 1. Camada Transformer
     word_embedding_model = models.Transformer(
         model_name_or_path=model_id,
         max_seq_length=max_seq_length,
         tokenizer_args={"padding_side": "left"},
-        model_args={
-            "attn_implementation": attn_implementation if em_cuda else "eager",
-            "torch_dtype": dtype_modelo,
-            "trust_remote_code": True,
-        },
+        processor_kwargs={"padding_side": "left"},
+        model_args=kwargs_para_modelo,
+        model_kwargs=kwargs_para_modelo,
     )
+    word_embedding_model.auto_model.to(dtype_modelo)
     word_embedding_model.auto_model.config.use_cache = False
 
     # 2. Ativacao ou desativacao do Gradient Checkpointing
