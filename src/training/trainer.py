@@ -471,20 +471,82 @@ def configurar_treinador(
         callbacks=callbacks,
     )
     # O Trainer pode ligar o GradScaler ao ver pesos em meia precisao.
-    # Na V100 isso gera "invalid argument" no RoPE e no Adam foreach.
+    # Na V100 o sqrt do Adam em float16 devolve "invalid argument".
     trainer.args.fp16 = False
     trainer.args.bf16 = False
     acelerador = getattr(trainer, "accelerator", None)
     if acelerador is not None and getattr(acelerador, "scaler", None) is not None:
         acelerador.scaler = None
     if optim == "adamw_torch":
-        _usar_adamw_sem_foreach(trainer, learning_rate, weight_decay)
+        _usar_adamw_sqrt_fp32(trainer, learning_rate, weight_decay)
 
     return trainer, telemetry_callback
 
 
-def _usar_adamw_sem_foreach(trainer: SentenceTransformerTrainer, learning_rate: float, weight_decay: float) -> None:
-    """Adam foreach chama _foreach_sqrt, que o driver 510 da V100 rejeita."""
+class AdamWSqrtFp32(torch.optim.Optimizer):
+    """
+    AdamW com momentos no mesmo dtype do peso e a raiz quadrada em float32.
+
+    O driver 510 da V100 recusa exp_avg_sq.sqrt() quando o tensor e float16
+    ("CUDA driver error: invalid argument"). A conta sobe para float32 e o
+    resultado volta ao dtype do parametro. Os estados continuam em float16,
+    senao os dois momentos do 4B nao cabem nos 32 GB.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+    ) -> None:
+        super().__init__(params, {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay})
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            lr = group["lr"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            for parametro in group["params"]:
+                if parametro.grad is None:
+                    continue
+                gradiente = parametro.grad
+                estado = self.state[parametro]
+                if len(estado) == 0:
+                    estado["step"] = 0
+                    estado["exp_avg"] = torch.zeros_like(parametro)
+                    estado["exp_avg_sq"] = torch.zeros_like(parametro)
+
+                exp_avg = estado["exp_avg"]
+                exp_avg_sq = estado["exp_avg_sq"]
+                estado["step"] += 1
+                passo = estado["step"]
+
+                if weight_decay != 0:
+                    parametro.mul_(1 - lr * weight_decay)
+
+                exp_avg.mul_(beta1).add_(gradiente, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(gradiente, gradiente, value=1 - beta2)
+
+                correcao_1 = 1 - beta1 ** passo
+                correcao_2_sqrt = (1 - beta2 ** passo) ** 0.5
+                denominador = exp_avg_sq.float().sqrt().div_(correcao_2_sqrt).add_(eps)
+                atualizacao = exp_avg.float().div_(denominador).mul_(lr / correcao_1)
+                parametro.add_(atualizacao.to(dtype=parametro.dtype), alpha=-1)
+
+        return loss
+
+
+def _usar_adamw_sqrt_fp32(trainer: SentenceTransformerTrainer, learning_rate: float, weight_decay: float) -> None:
+    """Troca o AdamW do PyTorch pelo passo com sqrt em float32."""
 
     def create_optimizer():
         modelo = trainer.model
@@ -503,7 +565,7 @@ def _usar_adamw_sem_foreach(trainer: SentenceTransformerTrainer, learning_rate: 
             },
         ]
         grupos = [grupo for grupo in grupos if grupo["params"]]
-        trainer.optimizer = torch.optim.AdamW(grupos, lr=learning_rate, foreach=False)
+        trainer.optimizer = AdamWSqrtFp32(grupos, lr=learning_rate, weight_decay=weight_decay)
         return trainer.optimizer
 
     trainer.create_optimizer = create_optimizer
