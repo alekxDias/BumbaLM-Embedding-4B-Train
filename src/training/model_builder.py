@@ -47,7 +47,11 @@ def construir_modelo_embedding(
     if em_cuda and ":" in str(device):
         torch.cuda.set_device(int(str(device).split(":", 1)[1]))
 
-    dtype_modelo = torch.bfloat16 if em_cuda and torch.cuda.is_bf16_supported() else (torch.float16 if em_cuda else torch.float32)
+    cap = torch.cuda.get_device_capability() if em_cuda else (0, 0)
+    # Hardware bfloat16 requer Ampere ou superior (Capability >= 8.0).
+    # Em Volta (V100, Capability 7.0), float16 e o formato nativo dos Tensor Cores.
+    usa_bf16 = em_cuda and cap[0] >= 8 and torch.cuda.is_bf16_supported()
+    dtype_modelo = torch.bfloat16 if usa_bf16 else (torch.float16 if em_cuda else torch.float32)
 
     rank = os.environ.get("RANK", "0")
     print(f"[rank {rank}] Construindo modelo em {device}", flush=True)
