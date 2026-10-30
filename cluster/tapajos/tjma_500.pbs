@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -N bumba_tjma500
+#PBS -o cluster/tapajos/logs/tjma_500.out
+#PBS -e cluster/tapajos/logs/tjma_500.err
+#PBS -q accel
+#PBS -l nodes=1:ppn=15
+#PBS -l walltime=04:00:00
+
+# Teste TJMA com ~500 processos na A100 (fila accel)
+# Rode o qsub de dentro de: /projetos/ctcca/nlp/bumbalm
+
+cd "$PBS_O_WORKDIR" || exit 1
+
+module load cuda
+
+# Ambiente conda do Tapajos (isolado em /projetos)
+CONDA_ENV=/projetos/ctcca/nlp/bumbalm/env
+PYTHON_BIN="${CONDA_ENV}/bin/python"
+
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${CONDA_ENV}/lib/"
+export HF_HOME="${PBS_O_WORKDIR}/hf_cache"
+export TRANSFORMERS_CACHE="${HF_HOME}"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME}"
+export CUDA_VISIBLE_DEVICES=0
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+mkdir -p cluster/tapajos/logs hf_cache data/raw data/processed_tjma experiments
+
+echo "Host: $(hostname)"
+echo "Dir : ${PBS_O_WORKDIR}"
+echo "Py  : ${PYTHON_BIN}"
+echo "Ini : $(date)"
+
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+  echo "ERRO: python nao encontrado em ${PYTHON_BIN}"
+  exit 1
+fi
+
+if [[ ! -f data/raw/pares_tjma.jsonl ]]; then
+  echo "ERRO: falta data/raw/pares_tjma.jsonl"
+  exit 1
+fi
+
+"${PYTHON_BIN}" scripts/run_pipeline.py \
+  --smoke_test \
+  --compare_baseline \
+  --gpus 0 \
+  --output_dir experiments/exp_tjma_500
+
+echo "Fim: $(date)"

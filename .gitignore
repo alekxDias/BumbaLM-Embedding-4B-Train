@@ -25,6 +25,7 @@ wheels/
 *.egg
 
 # Virtual Environments
+.conda_pkgs/
 .env
 .venv
 env/
