@@ -2,11 +2,14 @@
 #PBS -N bumba_tjma500
 #PBS -o cluster/tapajos/logs/tjma_500.out
 #PBS -e cluster/tapajos/logs/tjma_500.err
+#PBS -j oe
 #PBS -q accel
 #PBS -l nodes=1:ppn=15
-#PBS -l walltime=04:00:00
+#PBS -l walltime=12:00:00
 
-# Teste TJMA com ~500 processos na A100 (fila accel)
+# Teste TJMA com 500 processos.
+# A fila accel deste cluster entregou Tesla V100S 32 GB (gpunode01).
+# Lote, dtype e otimizador estao em configs/config_train.yaml.
 # Rode o qsub de dentro de: /projetos/ctcca/nlp/bumbalm
 
 cd "$PBS_O_WORKDIR" || exit 1
@@ -23,9 +26,13 @@ export HF_HOME="${PBS_O_WORKDIR}/hf_cache"
 export TRANSFORMERS_CACHE="${HF_HOME}"
 export HUGGINGFACE_HUB_CACHE="${HF_HOME}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_LAUNCH_BLOCKING=1
+export PYTHONUNBUFFERED=1
+export TOKENIZERS_PARALLELISM=false
 
 mkdir -p cluster/tapajos/logs hf_cache data/raw data/processed_tjma experiments
+
+# O teste anterior morreu no meio do treino. A pasta do experimento nao serve para retomar.
+rm -rf experiments/exp_tjma_500
 
 echo "=========================================="
 echo "Host: $(hostname)"
@@ -34,7 +41,7 @@ echo "Dir : ${PBS_O_WORKDIR}"
 echo "Py  : ${PYTHON_BIN}"
 echo "PBS GPU: ${CUDA_VISIBLE_DEVICES}"
 which nvidia-smi && nvidia-smi
-"${PYTHON_BIN}" -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.version.cuda, '| Dispositivo:', torch.cuda.get_device_name(0), '| Capability:', torch.cuda.get_device_capability(0), '| BF16:', torch.cuda.is_bf16_supported())"
+"${PYTHON_BIN}" -c "import torch; print('PyTorch:', torch.__version__, '| CUDA:', torch.version.cuda, '| Dispositivo:', torch.cuda.get_device_name(0))"
 echo "=========================================="
 
 if [[ ! -x "${PYTHON_BIN}" ]]; then

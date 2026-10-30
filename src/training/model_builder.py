@@ -25,7 +25,7 @@ def construir_modelo_embedding(
 ) -> SentenceTransformer:
     """
     Instancia e configura o pipeline SentenceTransformer para Full Fine-Tuning:
-    1. Camada Transformer: Base Qwen3 com precisao bfloat16 e atencao acelerada.
+    1. Camada Transformer: Base Qwen3 em bfloat16, como em train_4b.py.
     2. Camada Pooling: Modo 'lasttoken'.
     3. Camada Normalize: Projecao na esfera unitaria L2.
 
@@ -34,7 +34,6 @@ def construir_modelo_embedding(
         max_seq_length: Comprimento maximo de tokens por texto (padrao: 768).
         attn_implementation: Mecanismo de atencao ('sdpa' ou 'flash_attention_2').
         gradient_checkpointing: Se True, economiza VRAM recalculando ativacoes no backward.
-            Na GPU H200 (141 GB), manter False acelera o treino em ate 35%.
         device: Dispositivo de execucao ('cuda', 'cuda:0', 'cuda:1' ou 'cpu').
 
     Returns:
@@ -47,11 +46,8 @@ def construir_modelo_embedding(
     if em_cuda and ":" in str(device):
         torch.cuda.set_device(int(str(device).split(":", 1)[1]))
 
-    cap = torch.cuda.get_device_capability() if em_cuda else (0, 0)
-    # Hardware bfloat16 requer Ampere ou superior (Capability >= 8.0).
-    # Em Volta (V100, Capability 7.0), float16 e o formato nativo dos Tensor Cores.
-    usa_bf16 = em_cuda and cap[0] >= 8 and torch.cuda.is_bf16_supported()
-    dtype_modelo = torch.bfloat16 if usa_bf16 else (torch.float16 if em_cuda else torch.float32)
+    # Baseline carrega os pesos em bfloat16 e deixa fp16 do Trainer desligado.
+    dtype_modelo = torch.bfloat16 if em_cuda else torch.float32
 
     rank = os.environ.get("RANK", "0")
     print(f"[rank {rank}] Construindo modelo em {device}", flush=True)
@@ -92,7 +88,7 @@ def construir_modelo_embedding(
         if rank == "0":
             print("  - Gradient Checkpointing ativado com sucesso.")
     elif rank == "0":
-        print("  - Gradient Checkpointing desativado (priorizando velocidade na H200).")
+        print("  - Gradient Checkpointing desativado.")
 
     # 3. Full Fine-Tuning: Habilita gradientes em 100% dos parametros do Transformer
     for param in word_embedding_model.auto_model.parameters():

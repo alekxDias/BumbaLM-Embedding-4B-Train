@@ -27,6 +27,7 @@ import argparse
 import random
 import subprocess
 import sys
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -281,19 +282,22 @@ def main() -> None:
 
     # Parametros de treino
     train_cfg = cfg_train.get("treinamento", {})
-    batch_size = args.batch_size or train_cfg.get("batch_size_train", 64)
-    mini_batch_size = args.mini_batch_size or train_cfg.get("mini_batch_size", 32)
-    grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
+    batch_size = args.batch_size or train_cfg.get("batch_size_train", 16)
+    mini_batch_size = args.mini_batch_size or train_cfg.get("mini_batch_size", 1)
+    grad_accum = train_cfg.get("gradient_accumulation_steps", 4)
     lr = args.lr or train_cfg.get("learning_rate", 2.0e-5)
     weight_decay = train_cfg.get("weight_decay", 0.01)
     epochs = args.epochs or train_cfg.get("num_epochs", 1)
     warmup_ratio = train_cfg.get("warmup_ratio", 0.05)
-    bf16 = train_cfg.get("bf16", True)
-    grad_checkpointing = train_cfg.get("gradient_checkpointing", False)
-    num_workers = train_cfg.get("dataloader_num_workers", 4)
+    bf16 = bool(train_cfg.get("bf16", True))
+    fp16 = bool(train_cfg.get("fp16", False))
+    grad_checkpointing = bool(train_cfg.get("gradient_checkpointing", True))
+    num_workers = train_cfg.get("dataloader_num_workers", 0)
     pin_memory = train_cfg.get("dataloader_pin_memory", False)
-    eval_steps = train_cfg.get("eval_steps", 250)
-    save_steps = train_cfg.get("save_steps", 250)
+    eval_steps = train_cfg.get("eval_steps", 500)
+    save_steps = train_cfg.get("save_steps", 500)
+    optim_nome = str(train_cfg.get("optim", "adamw_torch"))
+    logging_steps = int(train_cfg.get("logging_steps", 10))
     loss_scale = cfg_train.get("loss", {}).get("scale", 50.0)
 
     dispositivo = _dispositivo_local()
@@ -309,7 +313,8 @@ def main() -> None:
     _imprimir(f"GPUs no passo        : {num_processos} | Dispositivo local: {dispositivo}")
     _imprimir(f"Batch por GPU        : {batch_size} (Acumulacao: {grad_accum})")
     _imprimir(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
-    _imprimir(f"Precisao bfloat16    : {bf16} | Atencao: {attn_impl}")
+    _imprimir(f"Atencao               : {attn_impl} | Checkpoint: {grad_checkpointing}")
+    _imprimir(f"Otimizador            : {optim_nome} | bf16: {bf16} | fp16: {fp16}")
     _imprimir(f"Dataloader Workers   : {num_workers} | Pin Memory: {pin_memory}")
     _imprimir("-" * 64)
 
@@ -338,7 +343,7 @@ def main() -> None:
             arq_val_chunks = dir_processados / "validacao_corpus_chunks.jsonl"
 
         if arq_val_processos.is_file() and arq_val_chunks.is_file():
-            eval_batch_size = cfg_train.get("avaliacao", {}).get("eval_batch_size", 128)
+            eval_batch_size = int(cfg_train.get("avaliacao", {}).get("eval_batch_size", 32))
             _imprimir("Configurando InformationRetrievalEvaluator sobre o split de validacao...")
             evaluator = criar_ir_evaluator(
                 caminho_processos=arq_val_processos,
@@ -375,12 +380,15 @@ def main() -> None:
         eval_steps=eval_steps,
         save_steps=save_steps,
         bf16=bf16,
+        fp16=fp16,
         dataloader_num_workers=num_workers,
         dataloader_pin_memory=pin_memory,
         scale=loss_scale,
         evaluator=evaluator,
         metric_for_best_model=metric_best,
         greater_is_better=greater_is_better,
+        optim=optim_nome,
+        logging_steps=logging_steps,
     )
 
     # 4. Execucao do Fine-Tuning
@@ -402,7 +410,12 @@ def main() -> None:
         _imprimir(f"Retomando treinamento a partir do checkpoint: {resume}")
     else:
         _imprimir("Disparando treinamento contrastivo com telemetria cientifica...")
-    trainer.train(resume_from_checkpoint=resume)
+    try:
+        trainer.train(resume_from_checkpoint=resume)
+    except Exception:
+        # O PBS separa stderr. Sem isto o traceback some do .out e so resta o codigo 1.
+        print(traceback.format_exc(), flush=True)
+        raise
 
     # 5. Salvamento do Modelo Final (somente o processo da primeira GPU)
     if _processo_principal():

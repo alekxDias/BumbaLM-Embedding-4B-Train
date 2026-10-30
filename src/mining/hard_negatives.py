@@ -56,11 +56,7 @@ def carregar_modelo_mineracao(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     em_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
-    cap = torch.cuda.get_device_capability() if em_cuda else (0, 0)
-    # Hardware bfloat16 requer Ampere ou superior (Capability >= 8.0).
-    # Em Volta (V100, Capability 7.0) ou Turing (T4), float16 e o formato nativo dos Tensor Cores.
-    usa_bf16 = em_cuda and cap[0] >= 8 and torch.cuda.is_bf16_supported()
-    dtype_modelo = torch.bfloat16 if usa_bf16 else (torch.float16 if em_cuda else torch.float32)
+    dtype_modelo = torch.bfloat16 if em_cuda else torch.float32
 
     print(f"Carregando modelo de mineracao: {model_id} no dispositivo: {device} (dtype: {dtype_modelo})...")
     modelo = SentenceTransformer(
@@ -718,7 +714,7 @@ def minerar_tripletos_contrastivos(
     saida.parent.mkdir(parents=True, exist_ok=True)
 
     device = modelo.device
-    dtype_tensor = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else (torch.float16 if device.type == "cuda" else torch.float32)
+    dtype_tensor = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     # 1. Indexacao rapida de processos
     indices_por_processo: dict[str, list[int]] = defaultdict(list)

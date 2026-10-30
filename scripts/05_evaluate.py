@@ -24,6 +24,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+import torch
+
 # Adiciona a raiz do repositorio ao PYTHONPATH
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
@@ -112,8 +114,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=64,
-        help="Batch size para inferencia durante a avaliacao.",
+        default=None,
+        help="Batch size para inferencia durante a avaliacao. Padrao: avaliacao.eval_batch_size do config.",
     )
     return parser.parse_args()
 
@@ -197,14 +199,19 @@ def main() -> None:
     print(f"Splits Alvo          : {', '.join(splits_para_avaliar)}")
     print(f"Diretorio de Dados   : {dir_processados}")
     print(f"Diretorio de Saida   : {dir_saida}")
+    batch_avaliacao = args.batch_size or int(cfg_train.get("avaliacao", {}).get("eval_batch_size", 32))
+
     print(f"Comparar Baseline    : {args.compare_baseline} ({args.baseline_id if args.compare_baseline else 'N/A'})")
-    print(f"Batch Size Avaliacao : {args.batch_size}")
+    print(f"Batch Size Avaliacao : {batch_avaliacao}")
     print("-" * 64)
 
     # 1. Carregamento do modelo treinado
     print(f"\nCarregando modelo treinado: {caminho_modelo} ...")
     attn_impl = cfg_train.get("modelo", {}).get("attn_implementation", "eager")
-    kwargs_modelo = {"attn_implementation": attn_impl}
+    kwargs_modelo = {
+        "attn_implementation": attn_impl,
+        "torch_dtype": torch.bfloat16,
+    }
     modelo_treinado = SentenceTransformer(str(caminho_modelo), trust_remote_code=True, model_kwargs=kwargs_modelo)
 
     # 2. Carregamento opcional do baseline zero-shot
@@ -242,7 +249,7 @@ def main() -> None:
             nome_avaliacao=f"{split_nome}_bumbalm",
             query_instruction=query_instruction,
             excluir_chunks_contaminados=True,
-            batch_size=args.batch_size,
+            batch_size=batch_avaliacao,
             avaliar_por_tribunal=True,
         )
 
@@ -257,7 +264,7 @@ def main() -> None:
                 nome_avaliacao=f"{split_nome}_baseline",
                 query_instruction=query_instruction,
                 excluir_chunks_contaminados=True,
-                batch_size=args.batch_size,
+                batch_size=batch_avaliacao,
                 avaliar_por_tribunal=True,
             )
 

@@ -12,33 +12,35 @@ modelo:
   pooling_mode: "lasttoken"
   normalizar_embeddings: true
   
-  # "sdpa" (nativo PyTorch 2.x), "eager" (estavel em qualquer driver) ou "flash_attention_2"
+  # Baseline (train_4b.py) nao fixa o kernel. eager evita materializar flash/sdpa.
   attn_implementation: "eager"
 
 treinamento:
-  # Lotes para A100 (40 GB) com GradCache. No smoke PBS use batch menor via CLI.
-  batch_size_train: 32
-  mini_batch_size: 8
-  gradient_accumulation_steps: 1
+  # Lote 16 = grupo contrastivo. Acumulacao 4 → passo efetivo 64.
+  # Mini-lote 1: na V100 o GradCache parte o forward; a perda continua no lote de 16.
+  batch_size_train: 16
+  mini_batch_size: 1
+  gradient_accumulation_steps: 4
 
-  # Otimizacao de memoria e velocidade
+  # Pesos em bfloat16. fp16 do Trainer fica desligado (GradScaler).
   bf16: true
-  gradient_checkpointing: false
+  fp16: false
+  gradient_checkpointing: true
+  optim: "adamw_torch"
+  logging_steps: 10
 
-  # Otimizacao de alimentacao CPU -> GPU
-  dataloader_num_workers: 4
+  dataloader_num_workers: 0
   dataloader_pin_memory: false
 
-  # Otimizador e escalonamento
   num_epochs: 1
   learning_rate: 2.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
 
-  # Frequencia de checkpoints e avaliacao (smoke com poucos dados: steps baixos)
-  eval_steps: 50
-  save_steps: 50
+  # Mesma cadencia do baseline 4B. Com 500 amostras o trainer encurta se o total de steps for menor.
+  eval_steps: 500
+  save_steps: 500
   save_total_limit: 2
   metric_for_best_model: "val_cosine_ndcg@10"
   greater_is_better: true
@@ -48,7 +50,8 @@ loss:
   scale: 50.0
 
 avaliacao:
-  eval_batch_size: 128
+  # InformationRetrievalEvaluator do train_4b.py usa 32. O 128 e do train_4b_v2.py.
+  eval_batch_size: 32
   metricas:
     - "ndcg@10"
     - "mrr@10"

@@ -344,26 +344,29 @@ def configurar_treinador(
     model: SentenceTransformer,
     train_dataset: Dataset,
     output_dir: Path | str,
-    batch_size: int = 96,
-    mini_batch_size: int = 96,
-    gradient_accumulation_steps: int = 1,
+    batch_size: int = 16,
+    mini_batch_size: int = 1,
+    gradient_accumulation_steps: int = 4,
     learning_rate: float = 2.0e-5,
     weight_decay: float = 0.01,
     num_epochs: int = 1,
     warmup_ratio: float = 0.05,
-    eval_steps: int = 250,
-    save_steps: int = 250,
+    eval_steps: int = 500,
+    save_steps: int = 500,
     bf16: bool = True,
-    dataloader_num_workers: int = 4,
+    fp16: bool = False,
+    dataloader_num_workers: int = 0,
     dataloader_pin_memory: bool = False,
     scale: float = 50.0,
     evaluator: Optional[Any] = None,
     metric_for_best_model: str = "val_cosine_ndcg@10",
     greater_is_better: bool = True,
+    optim: str = "adamw_torch",
+    logging_steps: int = 10,
 ) -> tuple[SentenceTransformerTrainer, ScientificMetricsCallback]:
     """
-    Instancia a CachedMultipleNegativesRankingLoss e configura o SentenceTransformerTrainer
-    com argumentos de alto desempenho otimizados para GPU H200 (141 GB).
+    Instancia a CachedMultipleNegativesRankingLoss e o SentenceTransformerTrainer
+    com a receita de codigos_antigos/train_4b.py: bf16 ligado, fp16 desligado, AdamW.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -412,7 +415,8 @@ def configurar_treinador(
     _imprimir(f"  - Negativos entre GPUs     : {juntar_gpus}")
     _imprimir(f"  - Total Steps Estimados    : {total_steps:,} | Warmup: {warmup_steps:,}")
     _imprimir(f"  - Taxa de Aprendizado (LR) : {learning_rate}")
-    _imprimir(f"  - Precisao bfloat16        : {bf16}")
+    _imprimir(f"  - Trainer bf16/fp16        : {bool(bf16)}/{bool(fp16)}")
+    _imprimir(f"  - Otimizador               : {optim}")
     _imprimir(f"  - Dataloader Workers       : {dataloader_num_workers} | Pin Memory: {dataloader_pin_memory}")
     if tem_avaliador:
         _imprimir(f"  - Avaliador de Validacao   : Ativado (a cada {eval_steps_efetivo} steps)")
@@ -430,8 +434,10 @@ def configurar_treinador(
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
-        bf16=bool(bf16 and (torch.cuda.get_device_capability()[0] >= 8 if torch.cuda.is_available() else False) and torch.cuda.is_bf16_supported()),
-        fp16=bool(torch.cuda.is_available() and not (bf16 and (torch.cuda.get_device_capability()[0] >= 8) and torch.cuda.is_bf16_supported())),
+        bf16=bool(bf16),
+        fp16=bool(fp16),
+        optim=optim,
+        logging_steps=logging_steps,
         eval_strategy="steps" if tem_avaliador else "no",
         eval_steps=eval_steps_efetivo if tem_avaliador else None,
         save_strategy="steps",
@@ -440,7 +446,6 @@ def configurar_treinador(
         load_best_model_at_end=tem_avaliador,
         metric_for_best_model=metric_for_best_model if tem_avaliador else None,
         greater_is_better=greater_is_better if tem_avaliador else None,
-        logging_steps=10,
         report_to="none",
         dataloader_num_workers=dataloader_num_workers,
         dataloader_pin_memory=dataloader_pin_memory,
