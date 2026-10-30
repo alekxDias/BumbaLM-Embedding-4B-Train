@@ -210,7 +210,7 @@ def main() -> None:
     attn_impl = cfg_train.get("modelo", {}).get("attn_implementation", "eager")
     kwargs_modelo = {
         "attn_implementation": attn_impl,
-        "torch_dtype": torch.bfloat16,
+        "torch_dtype": torch.float16,
     }
     modelo_treinado = SentenceTransformer(str(caminho_modelo), trust_remote_code=True, model_kwargs=kwargs_modelo)
 

@@ -56,7 +56,7 @@ def carregar_modelo_mineracao(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     em_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
-    dtype_modelo = torch.bfloat16 if em_cuda else torch.float32
+    dtype_modelo = torch.float16 if em_cuda else torch.float32
 
     print(f"Carregando modelo de mineracao: {model_id} no dispositivo: {device} (dtype: {dtype_modelo})...")
     modelo = SentenceTransformer(
@@ -714,7 +714,7 @@ def minerar_tripletos_contrastivos(
     saida.parent.mkdir(parents=True, exist_ok=True)
 
     device = modelo.device
-    dtype_tensor = torch.bfloat16 if device.type == "cuda" else torch.float32
+    dtype_tensor = torch.float16 if device.type == "cuda" else torch.float32
 
     # 1. Indexacao rapida de processos
     indices_por_processo: dict[str, list[int]] = defaultdict(list)

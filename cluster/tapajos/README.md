@@ -7,7 +7,7 @@ Destino no cluster:
 ```
 
 Fila GPU: `accel`, no `gpunode01`, Tesla V100S 32 GB. O teste usa a receita
-de `codigos_antigos/train_4b.py`: bfloat16, lote 16, mini-lote 1, acumulacao 4
+de `codigos_antigos/train_4b.py`: float16, lote 16, mini-lote 1, acumulacao 4
 (lote efetivo 64), checkpoint ligado, AdamW. O walltime e 12 horas.
 
 ```powershell

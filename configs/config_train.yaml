@@ -22,12 +22,11 @@ treinamento:
   mini_batch_size: 1
   gradient_accumulation_steps: 4
 
-  # Pesos em bfloat16. fp16 do Trainer fica desligado (GradScaler).
-  bf16: true
+  bf16: false
   fp16: false
   gradient_checkpointing: true
   optim: "adamw_torch"
-  logging_steps: 10
+  logging_steps: 1
 
   dataloader_num_workers: 0
   dataloader_pin_memory: false

@@ -353,7 +353,7 @@ def configurar_treinador(
     warmup_ratio: float = 0.05,
     eval_steps: int = 500,
     save_steps: int = 500,
-    bf16: bool = True,
+    bf16: bool = False,
     fp16: bool = False,
     dataloader_num_workers: int = 0,
     dataloader_pin_memory: bool = False,
@@ -362,11 +362,12 @@ def configurar_treinador(
     metric_for_best_model: str = "val_cosine_ndcg@10",
     greater_is_better: bool = True,
     optim: str = "adamw_torch",
-    logging_steps: int = 10,
+    logging_steps: int = 1,
 ) -> tuple[SentenceTransformerTrainer, ScientificMetricsCallback]:
     """
-    Instancia a CachedMultipleNegativesRankingLoss e o SentenceTransformerTrainer
-    com a receita de codigos_antigos/train_4b.py: bf16 ligado, fp16 desligado, AdamW.
+    Instancia a CachedMultipleNegativesRankingLoss e o SentenceTransformerTrainer.
+    Nesta branch os flags bf16/fp16 do Trainer ficam desligados: a V100 recusa
+    o kernel bfloat16, e o GradScaler do fp16 quebra com pesos ja em float16.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -469,5 +470,40 @@ def configurar_treinador(
         evaluator=evaluator,
         callbacks=callbacks,
     )
+    # O Trainer pode ligar o GradScaler ao ver pesos em meia precisao.
+    # Na V100 isso gera "invalid argument" no RoPE e no Adam foreach.
+    trainer.args.fp16 = False
+    trainer.args.bf16 = False
+    acelerador = getattr(trainer, "accelerator", None)
+    if acelerador is not None and getattr(acelerador, "scaler", None) is not None:
+        acelerador.scaler = None
+    if optim == "adamw_torch":
+        _usar_adamw_sem_foreach(trainer, learning_rate, weight_decay)
 
     return trainer, telemetry_callback
+
+
+def _usar_adamw_sem_foreach(trainer: SentenceTransformerTrainer, learning_rate: float, weight_decay: float) -> None:
+    """Adam foreach chama _foreach_sqrt, que o driver 510 da V100 rejeita."""
+
+    def create_optimizer():
+        modelo = trainer.model
+        try:
+            nomes_decay = set(trainer.get_decay_parameter_names(modelo))
+        except TypeError:
+            nomes_decay = set(trainer.get_decay_parameter_names())
+        grupos = [
+            {
+                "params": [p for n, p in modelo.named_parameters() if n in nomes_decay and p.requires_grad],
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [p for n, p in modelo.named_parameters() if n not in nomes_decay and p.requires_grad],
+                "weight_decay": 0.0,
+            },
+        ]
+        grupos = [grupo for grupo in grupos if grupo["params"]]
+        trainer.optimizer = torch.optim.AdamW(grupos, lr=learning_rate, foreach=False)
+        return trainer.optimizer
+
+    trainer.create_optimizer = create_optimizer

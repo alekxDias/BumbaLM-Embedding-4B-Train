@@ -25,7 +25,7 @@ def construir_modelo_embedding(
 ) -> SentenceTransformer:
     """
     Instancia e configura o pipeline SentenceTransformer para Full Fine-Tuning:
-    1. Camada Transformer: Base Qwen3 em bfloat16, como em train_4b.py.
+    1. Camada Transformer: Base Qwen3 em float16 (V100, driver sem kernel bf16).
     2. Camada Pooling: Modo 'lasttoken'.
     3. Camada Normalize: Projecao na esfera unitaria L2.
 
@@ -46,8 +46,8 @@ def construir_modelo_embedding(
     if em_cuda and ":" in str(device):
         torch.cuda.set_device(int(str(device).split(":", 1)[1]))
 
-    # Baseline carrega os pesos em bfloat16 e deixa fp16 do Trainer desligado.
-    dtype_modelo = torch.bfloat16 if em_cuda else torch.float32
+    # V100 + driver 510: bfloat16 no RoPE devolve "CUDA driver error: invalid argument".
+    dtype_modelo = torch.float16 if em_cuda else torch.float32
 
     rank = os.environ.get("RANK", "0")
     print(f"[rank {rank}] Construindo modelo em {device}", flush=True)

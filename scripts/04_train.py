@@ -289,7 +289,7 @@ def main() -> None:
     weight_decay = train_cfg.get("weight_decay", 0.01)
     epochs = args.epochs or train_cfg.get("num_epochs", 1)
     warmup_ratio = train_cfg.get("warmup_ratio", 0.05)
-    bf16 = bool(train_cfg.get("bf16", True))
+    bf16 = bool(train_cfg.get("bf16", False))
     fp16 = bool(train_cfg.get("fp16", False))
     grad_checkpointing = bool(train_cfg.get("gradient_checkpointing", True))
     num_workers = train_cfg.get("dataloader_num_workers", 0)
@@ -297,7 +297,7 @@ def main() -> None:
     eval_steps = train_cfg.get("eval_steps", 500)
     save_steps = train_cfg.get("save_steps", 500)
     optim_nome = str(train_cfg.get("optim", "adamw_torch"))
-    logging_steps = int(train_cfg.get("logging_steps", 10))
+    logging_steps = int(train_cfg.get("logging_steps", 1))
     loss_scale = cfg_train.get("loss", {}).get("scale", 50.0)
 
     dispositivo = _dispositivo_local()
