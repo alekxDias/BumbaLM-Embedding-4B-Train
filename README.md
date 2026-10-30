@@ -210,7 +210,26 @@ A cada execucao do pipeline sao produzidos relatorios rastreaveis para composica
 
 ## TJMA com HN vs sem HN vs baseline
 
-Na branch `exp/ft-sem-hard-negatives`, o `config_base.yaml` usa **apenas TJMA** e a pasta `data/processed_tjma`. Refaca o experimento do zero:
+Na branch `exp/ft-sem-hard-negatives`, o `config_base.yaml` usa **apenas TJMA**, `data/raw/pares_tjma.jsonl` e `data/processed_tjma`.
+
+### Teste com 500 processos — Tapajos A100
+
+Veja o guia completo em [`cluster/tapajos/README.md`](cluster/tapajos/README.md). Resumo:
+
+```bash
+# Coloque pares_tjma.jsonl em data/raw/, depois:
+qsub cluster/tapajos/tjma_500.pbs
+qstat
+```
+
+Equivalente local/manual:
+
+```bash
+python scripts/run_pipeline.py --smoke_test --compare_baseline --gpus 0 \
+  --output_dir experiments/exp_tjma_500
+```
+
+### Experimento completo (depois do teste com 500)
 
 ```bash
 # 1) Dados uma vez (split + chunk com anti-vazamento)

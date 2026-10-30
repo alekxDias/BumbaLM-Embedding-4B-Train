@@ -31,6 +31,6 @@ mineracao_negativos:
   limiar_similaridade_max: 0.85
   top_k_candidatos: 200
   
-  # Lotes de mineracao acelerada em GPU
-  encode_batch_size: 256
-  query_batch_size: 256
+  # Lotes de mineracao em A100
+  encode_batch_size: 128
+  query_batch_size: 128

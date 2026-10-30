@@ -16,29 +16,29 @@ modelo:
   attn_implementation: "sdpa"
 
 treinamento:
-  # Lotes reais com GradCache otimizados para GPU
-  batch_size_train: 64
-  mini_batch_size: 16
+  # Lotes para A100 (40 GB) com GradCache. No smoke PBS use batch menor via CLI.
+  batch_size_train: 32
+  mini_batch_size: 8
   gradient_accumulation_steps: 1
-  
+
   # Otimizacao de memoria e velocidade
   bf16: true
-  gradient_checkpointing: false # Desativado: usa a VRAM extra
-  
+  gradient_checkpointing: false
+
   # Otimizacao de alimentacao CPU -> GPU
   dataloader_num_workers: 4
   dataloader_pin_memory: false
-  
+
   # Otimizador e escalonamento
   num_epochs: 1
   learning_rate: 2.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
-  
-  # Frequencia de checkpoints e avaliacao
-  eval_steps: 250
-  save_steps: 250
+
+  # Frequencia de checkpoints e avaliacao (smoke com poucos dados: steps baixos)
+  eval_steps: 50
+  save_steps: 50
   save_total_limit: 2
   metric_for_best_model: "val_cosine_ndcg@10"
   greater_is_better: true

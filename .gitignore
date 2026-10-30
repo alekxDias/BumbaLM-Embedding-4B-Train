@@ -38,8 +38,13 @@ data/raw/*
 !data/raw/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+data/processed_tjma/*
+!data/processed_tjma/.gitkeep
 experiments/*
 !experiments/.gitkeep
+hf_cache/
+cluster/tapajos/logs/*
+!cluster/tapajos/logs/.gitkeep
 
 # Documentacao local (nao sobe para o repositorio)
 docs/

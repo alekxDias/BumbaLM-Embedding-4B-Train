@@ -111,13 +111,17 @@ def main() -> None:
         else:
             caminhos_entrada = [caminho_in]
     else:
-        dir_base_str = dados_cfg.get("diretorio_base_pares", "/home/fabio.lobato/bumbalm/Pares_Tribunais")
+        dir_base_str = dados_cfg.get("diretorio_base_pares", "data/raw")
         dir_base = Path(dir_base_str)
+        if not dir_base.is_absolute():
+            dir_base = BASE_DIR / dir_base
         if not dir_base.is_dir():
             if (BASE_DIR.parent / "Pares_Tribunais").is_dir():
                 dir_base = BASE_DIR.parent / "Pares_Tribunais"
             elif (BASE_DIR / "Pares_Tribunais").is_dir():
                 dir_base = BASE_DIR / "Pares_Tribunais"
+            elif (BASE_DIR / "data" / "raw").is_dir():
+                dir_base = BASE_DIR / "data" / "raw"
 
         arquivos_config = dados_cfg.get("arquivos_pares", [])
         if not arquivos_config:

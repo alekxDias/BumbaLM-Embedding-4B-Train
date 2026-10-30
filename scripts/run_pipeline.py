@@ -215,9 +215,17 @@ def main() -> None:
             args.max_por_tribunal = 500
         if args.epochs is None:
             args.epochs = 1
+        # Lotes menores para caber em A100 no teste rapido
+        if args.batch_size is None:
+            args.batch_size = 16
+        if args.mini_batch_size is None:
+            args.mini_batch_size = 8
         print("=" * 64)
         print("MODO SMOKE TEST ATIVADO: Execucao rapida para validacao do pipeline.")
-        print(f"Max reg/tribunal: {args.max_por_tribunal} | Hiperparametros: Originais do config_train.yaml")
+        print(
+            f"Max reg/tribunal: {args.max_por_tribunal} | "
+            f"epochs={args.epochs} | batch={args.batch_size} | mini_batch={args.mini_batch_size}"
+        )
         print("=" * 64)
 
     if not args.all and not args.steps:
