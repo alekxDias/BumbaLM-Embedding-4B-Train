@@ -31,6 +31,6 @@ mineracao_negativos:
   limiar_similaridade_max: 0.85
   top_k_candidatos: 200
   
-  # Lotes de mineracao em A100
-  encode_batch_size: 128
-  query_batch_size: 128
+  # Lotes de mineracao (32 para V100 32GB em modo eager)
+  encode_batch_size: 32
+  query_batch_size: 64

@@ -90,6 +90,9 @@ def _encodar_uma_gpu(
     batch_size: int,
     show_progress: bool,
 ) -> np.ndarray:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
     return modelo.encode(
         textos,
         batch_size=batch_size,
