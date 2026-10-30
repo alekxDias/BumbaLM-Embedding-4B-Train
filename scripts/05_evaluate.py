@@ -203,13 +203,15 @@ def main() -> None:
 
     # 1. Carregamento do modelo treinado
     print(f"\nCarregando modelo treinado: {caminho_modelo} ...")
-    modelo_treinado = SentenceTransformer(str(caminho_modelo), trust_remote_code=True)
+    attn_impl = cfg_train.get("modelo", {}).get("attn_implementation", "eager")
+    kwargs_modelo = {"attn_implementation": attn_impl}
+    modelo_treinado = SentenceTransformer(str(caminho_modelo), trust_remote_code=True, model_kwargs=kwargs_modelo)
 
     # 2. Carregamento opcional do baseline zero-shot
     modelo_baseline: Optional[SentenceTransformer] = None
     if args.compare_baseline:
         print(f"Carregando modelo baseline zero-shot: {args.baseline_id} ...")
-        modelo_baseline = SentenceTransformer(args.baseline_id, trust_remote_code=True)
+        modelo_baseline = SentenceTransformer(args.baseline_id, trust_remote_code=True, model_kwargs=kwargs_modelo)
 
     relatorio_consolidado_geral: dict[str, Any] = {}
 

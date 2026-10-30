@@ -271,8 +271,6 @@ def main() -> None:
                 cmd.extend(["--max_por_tribunal", str(args.max_por_tribunal)])
 
         if etapa == "mine":
-            if args.batch_size:
-                cmd.extend(["--batch_size", str(args.batch_size)])
             # A mineracao reparte vetorizacao e busca. Nao usa o torchrun do treino.
             if args.gpus:
                 cmd.extend(["--gpus", args.gpus])

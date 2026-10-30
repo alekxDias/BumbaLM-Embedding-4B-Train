@@ -12,8 +12,8 @@ modelo:
   pooling_mode: "lasttoken"
   normalizar_embeddings: true
   
-  # "sdpa" (nativo PyTorch 2.x) ou "flash_attention_2"
-  attn_implementation: "sdpa"
+  # "sdpa" (nativo PyTorch 2.x), "eager" (estavel em qualquer driver) ou "flash_attention_2"
+  attn_implementation: "eager"
 
 treinamento:
   # Lotes para A100 (40 GB) com GradCache. No smoke PBS use batch menor via CLI.
