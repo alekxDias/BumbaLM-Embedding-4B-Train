@@ -1,9 +1,11 @@
 # Parametros de Treinamento
+# Perfil do TCC: uma Tesla V100S de 32 GB no cluster (sem bf16 nativo, sem FlashAttention 2).
 
 hardware:
   # Vazio: uma GPU. "1": somente a segunda placa.
   # "0,1": treino em DDP e mineracao nas duas placas.
-  gpus: "0,1"
+  # No PBS a GPU reservada ja vem em CUDA_VISIBLE_DEVICES: deixe vazio.
+  gpus: ""
 
 modelo:
   model_id: "Qwen/Qwen3-Embedding-4B"
@@ -12,34 +14,49 @@ modelo:
   pooling_mode: "lasttoken"
   normalizar_embeddings: true
   
-  # "sdpa" (nativo PyTorch 2.x) ou "flash_attention_2"
+  # "sdpa" (nativo PyTorch 2.x). A V100 nao roda "flash_attention_2".
   attn_implementation: "sdpa"
 
+# Full fine-tuning de 4B nao cabe em 32 GB (pesos + gradientes + Adam passam de 60 GB).
+# Com LoRA a base fica congelada em fp16 e so os adaptadores treinam.
+# Na H200, ativo: false volta ao full fine-tuning do artigo.
+lora:
+  ativo: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
 treinamento:
-  # Lotes reais com GradCache otimizados para GPU
+  # Lote contrastivo: cada ancora ve os positivos e negativos das outras 63 tuplas.
+  # mini_batch_size so controla a memoria do GradCache, nao muda o resultado.
   batch_size_train: 64
-  mini_batch_size: 16
+  mini_batch_size: 4
   gradient_accumulation_steps: 1
   
-  # Otimizacao de memoria e velocidade
-  bf16: true
-  gradient_checkpointing: false # Desativado: usa a VRAM extra
+  # "auto": bf16 na A100/H200, fp16 na V100.
+  precisao: "auto"
+  gradient_checkpointing: true # Obrigatorio na V100
+  
+  # Sorteia N tuplas (mesma semente nas tres variantes). null usa todas.
+  # Na V100 a variante com 5 negativos custa ~3,5x mais por tupla que a sem negativos.
+  limite_tuplas: null
   
   # Otimizacao de alimentacao CPU -> GPU
   dataloader_num_workers: 4
   dataloader_pin_memory: false
   
-  # Otimizador e escalonamento
+  # Otimizador e escalonamento. LoRA pede LR maior que o full fine-tuning (2e-5 no artigo).
   num_epochs: 1
-  learning_rate: 2.0e-5
+  learning_rate: 1.0e-4
   weight_decay: 0.01
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
   
   # Frequencia de checkpoints e avaliacao
-  eval_steps: 250
-  save_steps: 250
-  save_total_limit: 2
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 2 # O melhor checkpoint e sempre mantido
   metric_for_best_model: "val_cosine_ndcg@10"
   greater_is_better: true
 
@@ -48,7 +65,13 @@ loss:
   scale: 50.0
 
 avaliacao:
-  eval_batch_size: 128
+  eval_batch_size: 32
+  # Validacao durante o treino com amostra fixa de processos (mesma nas tres variantes).
+  # O corpus inteiro de validacao levaria ~1 h por avaliacao na V100.
+  # A Etapa 5 sempre usa o split de teste completo.
+  max_processos_val: 1000
+  # Precisao dos pesos na Etapa 5. "fp32" se aparecer NaN em fp16.
+  precisao: "auto"
   metricas:
     - "ndcg@10"
     - "mrr@10"

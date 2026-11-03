@@ -1,0 +1,23 @@
+#!/bin/bash
+#PBS -N bumbalm_minerar
+#PBS -q accel
+#PBS -l nodes=1:ppn=15
+# Tempo maximo do job. Descomente e ajuste quando souber o limite da fila accel:
+##PBS -l walltime=72:00:00
+# Saida e erro juntos. Caminho relativo a pasta de onde voce rodou o qsub (raiz do projeto).
+#PBS -j oe
+#PBS -o logs/bumbalm_minerar.pbs.log
+
+cd "$PBS_O_WORKDIR"
+source cluster/env.sh
+set -eo pipefail
+
+LOG="logs/bumbalm_minerar_${PBS_JOBID%%.*}.log"
+echo "Job $PBS_JOBID em $(hostname) | $(date)" | tee "$LOG"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | tee -a "$LOG"
+python -c "import torch; print('PyTorch', torch.__version__, '| GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NENHUMA')" | tee -a "$LOG"
+
+# Etapas 3 e 3b: hard negatives com o modelo base e a copia com negativos aleatorios.
+# Retoma sozinha se o job cair: reaproveita os vetores salvos e continua as tuplas.
+#   qsub cluster/pbs/02_minerar.pbs
+python -u scripts/run_pipeline.py --steps mine,random 2>&1 | tee -a "$LOG"

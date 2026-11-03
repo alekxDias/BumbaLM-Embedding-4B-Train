@@ -73,6 +73,10 @@ def montar_estruturas_ir(
     excluir_chunks_contaminados: bool = True,
     limite_queries: Optional[int] = None,
     filtro_tribunal: Optional[str] = None,
+    limite_processos: Optional[int] = None,
+    seed: int = 42,
+    relevancia_por_grupo: bool = True,
+    estatisticas: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, str], dict[str, str], dict[str, set[str]]]:
     """
     Monta as estruturas de dados fundamentais para o InformationRetrievalEvaluator:
@@ -84,12 +88,31 @@ def montar_estruturas_ir(
     - Se excluir_chunks_contaminados=True, chunks marcados com is_ementa_leak=True
       sao integralmente descartados do corpus e da lista de relevantes.
     - Processos que nao possuirem nenhum chunk limpo remanescente sao omitidos do benchmark.
+
+    relevancia_por_grupo: os chunks limpos dos processos do mesmo grupo de quase duplicatas
+    (ementas acima do limiar de Jaccard, mesmo split) tambem contam como relevantes. Sem isso, achar o
+    acordao "gemeo" contaria como erro.
+
+    estatisticas: se for um dict, recebe as contagens de exclusao para o relatorio.
+
+    limite_processos sorteia processos com a semente e mantem no corpus so os chunks deles.
+    Serve para a validacao durante o treino. O corpus fica menor, entao as metricas sobem
+    em relacao ao split completo: compare variantes sempre com a mesma amostra.
     """
     # 1. Filtra tribunal se especificado
     if filtro_tribunal:
         tribunal_alvo = filtro_tribunal.upper().strip()
         processos = [p for p in processos if p.tribunal.upper().strip() == tribunal_alvo]
         chunks = [c for c in chunks if c.tribunal.upper().strip() == tribunal_alvo]
+
+    # 1b. Amostra fixa de processos. Ordena antes para o sorteio nao depender da ordem do arquivo.
+    if limite_processos and len(processos) > limite_processos:
+        import random
+
+        ordenados = sorted(processos, key=lambda p: p.id)
+        processos = random.Random(seed).sample(ordenados, int(limite_processos))
+        ids_amostra = {p.id for p in processos}
+        chunks = [c for c in chunks if c.processo_id in ids_amostra]
 
     # 2. Construtor do corpus e mapeamento processo -> chunks validos
     corpus: dict[str, str] = {}
@@ -105,18 +128,32 @@ def montar_estruturas_ir(
         corpus[cid] = ch.texto
         processo_para_chunk_ids[ch.processo_id].add(cid)
 
+    # Chunks limpos de cada grupo de quase duplicatas presente neste split
+    chunks_por_grupo: dict[str, set[str]] = defaultdict(set)
+    for proc in processos:
+        chunks_por_grupo[proc.grupo_duplicata] |= processo_para_chunk_ids.get(proc.id, set())
+
     # 3. Construtor de queries e mapa de relevancias
     queries: dict[str, str] = {}
     relevant_docs: dict[str, set[str]] = {}
     processos_sem_chunk_limpo = 0
+    queries_com_gemeos = 0
 
     for proc in processos:
         pid = proc.id
-        chunks_relevantes = processo_para_chunk_ids.get(pid, set())
+        proprios = processo_para_chunk_ids.get(pid, set())
 
-        if not chunks_relevantes:
+        # Sem chunk limpo proprio a consulta sai, mesmo que o gemeo tenha: a ementa
+        # copiada no cabecalho era a unica "resposta" desse acordao.
+        if not proprios:
             processos_sem_chunk_limpo += 1
             continue
+
+        chunks_relevantes = proprios
+        if relevancia_por_grupo:
+            chunks_relevantes = chunks_por_grupo[proc.grupo_duplicata]
+            if len(chunks_relevantes) > len(proprios):
+                queries_com_gemeos += 1
 
         ementa_limpa = proc.ementa.strip()
         if not ementa_limpa:
@@ -142,6 +179,16 @@ def montar_estruturas_ir(
         chunks_descartados_vazamento,
         processos_sem_chunk_limpo,
     )
+    if estatisticas is not None:
+        estatisticas.update({
+            "processos_avaliados": len(processos),
+            "queries": len(queries),
+            "chunks_no_corpus": len(corpus),
+            "chunks_descartados_vazamento": chunks_descartados_vazamento,
+            "processos_sem_chunk_limpo": processos_sem_chunk_limpo,
+            "queries_com_quase_duplicatas_relevantes": queries_com_gemeos,
+            "relevancia_por_grupo": relevancia_por_grupo,
+        })
 
     return queries, corpus, relevant_docs
 
@@ -156,6 +203,8 @@ def criar_ir_evaluator(
     filtro_tribunal: Optional[str] = None,
     batch_size: int = 64,
     show_progress_bar: bool = True,
+    limite_processos: Optional[int] = None,
+    seed: int = 42,
 ) -> InformationRetrievalEvaluator:
     """
     Instancia e retorna o InformationRetrievalEvaluator configurado para o dominio juridico.
@@ -169,6 +218,7 @@ def criar_ir_evaluator(
     processos = carregar_processos_jsonl(caminho_processos)
     chunks = carregar_chunks_jsonl(caminho_chunks)
 
+    estatisticas: dict[str, Any] = {}
     queries, corpus, relevant_docs = montar_estruturas_ir(
         processos=processos,
         chunks=chunks,
@@ -176,6 +226,18 @@ def criar_ir_evaluator(
         excluir_chunks_contaminados=excluir_chunks_contaminados,
         limite_queries=limite_queries,
         filtro_tribunal=filtro_tribunal,
+        limite_processos=limite_processos,
+        seed=seed,
+        estatisticas=estatisticas,
+    )
+    print(
+        f"Avaliador '{nome}': {len(queries):,} queries | {len(corpus):,} chunks no corpus"
+        + (f" (amostra de {limite_processos:,} processos)" if limite_processos else "")
+    )
+    print(
+        f"  - Fora da avaliacao: {estatisticas['chunks_descartados_vazamento']:,} chunks com vazamento | "
+        f"{estatisticas['processos_sem_chunk_limpo']:,} processos sem chunk limpo | "
+        f"{estatisticas['queries_com_quase_duplicatas_relevantes']:,} consultas com quase duplicatas relevantes"
     )
 
     if not queries:
@@ -202,6 +264,8 @@ def criar_ir_evaluator(
         precision_recall_at_k=[1, 5, 10],
         map_at_k=[100],
     )
+    # Lido por executar_avaliacao_completa para o relatorio.
+    evaluator.estatisticas_bumbalm = estatisticas
 
     return evaluator
 
@@ -285,6 +349,7 @@ def executar_avaliacao_completa(
     )
     metricas_global = formatar_metricas_ir(metricas_brutas_global, prefixo_nome=f"{nome_avaliacao}_global")
     relatorio_geral["metricas_global"] = metricas_global
+    relatorio_geral["protocolo"] = getattr(evaluator_global, "estatisticas_bumbalm", {})
 
     # 2. Avaliacao Segmentada por Tribunal
     if avaliar_por_tribunal:
@@ -324,6 +389,8 @@ def executar_avaliacao_completa(
             f.write(f"RELATORIO DE AVALIACAO IN-DOMAIN - {nome_avaliacao.upper()}\n")
             f.write("=" * 64 + "\n\n")
             f.write(f"Descontaminacao de Chunk 0 : {excluir_chunks_contaminados}\n")
+            for chave, valor in relatorio_geral["protocolo"].items():
+                f.write(f"{chave:<40}: {valor}\n")
             f.write(f"Instrucao de Query         : {query_instruction.strip()}\n\n")
 
             f.write("--- RESULTADOS GLOBAIS ---\n")

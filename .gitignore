@@ -52,3 +52,9 @@ docs/
 *~
 .DS_Store
 Thumbs.db
+
+# Saidas do cluster (TCC)
+data/processed_*/
+data/smoke_*/
+logs/
+hf_cache/

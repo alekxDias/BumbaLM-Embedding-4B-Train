@@ -174,6 +174,7 @@ def carregar_processos_jsonl(caminho: Path) -> list[ProcessoJudicial]:
             ementa=dado.get("str_ementa", ""),
             inteiro_teor="",
             metadados=dado.get("metadados", {}),
+            grupo_duplicata=dado.get("grupo_duplicata", ""),
         )
         processos.append(p)
     return processos
@@ -196,6 +197,7 @@ def carregar_chunks_jsonl(caminho: Path) -> list[ChunkProcesso]:
             texto=dado.get("texto", ""),
             contem_vazamento_ementa=bool(dado.get("contem_vazamento_ementa", False)),
             motivo_vazamento=dado.get("motivo_vazamento"),
+            cobertura_ementa=float(dado.get("cobertura_ementa", 0.0) or 0.0),
         )
         chunks.append(ch)
     return chunks
@@ -317,6 +319,9 @@ def main() -> None:
         f.write(f"Tripletos Gerados        : {stats['tripletos_salvos']:,}\n")
         f.write(f"Tripletos desta execucao : {stats.get('tripletos_novos', stats['tripletos_salvos']):,}\n")
         f.write(f"Chunks sem 5 Negativos   : {stats['chunks_sem_negativos_suficientes']:,}\n")
+        f.write(f"Vazados nao usados como positivo : {stats.get('chunks_vazados_ignorados_como_positivo', 0):,}\n")
+        f.write(f"Vazados fora dos negativos       : {stats.get('chunks_vazados_fora_dos_negativos', 0):,}\n")
+        f.write(f"Processos com quase duplicatas mascaradas: {stats.get('processos_com_quase_duplicatas', 0):,}\n")
         f.write(f"Margem Media (Pos - Neg) : {stats['media_margem_tripletos']:.4f}\n")
         f.write(f"Embeddings do Corpus     : {arq_embeddings}\n")
 

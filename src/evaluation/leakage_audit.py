@@ -17,6 +17,9 @@ _ROTULOS_INICIAIS = re.compile(
     r"vistos?|relatados?|discutidos?|e acordam)\s+"
 )
 
+# Faixas do histograma de cobertura gravado no relatorio da Etapa 2.
+_FAIXAS_COBERTURA = [0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 0.75, 1.01]
+
 
 def normalizar_texto_auditoria(texto: str) -> str:
     """
@@ -36,11 +39,45 @@ def remover_rotulos_iniciais(texto: str) -> str:
         texto = novo
 
 
+def _shingles(palavras: list[str], n: int) -> set[tuple[str, ...]]:
+    return {tuple(palavras[i : i + n]) for i in range(len(palavras) - n + 1)}
+
+
+def cobertura_ementa(
+    palavras_ementa: list[str],
+    palavras_chunk: list[str],
+    ngram: int = 6,
+) -> tuple[float, int]:
+    """
+    Fracao das palavras da ementa que aparecem copiadas no chunk, em blocos de `ngram` palavras.
+
+    Pega copias parciais que a janela de 200 caracteres perde: a ementa cortada na borda do
+    chunk ou interrompida por rodape e numeracao. Paráfrase nao conta, e frase-padrao curta
+    (menos de `ngram` palavras, ex. "recurso conhecido e desprovido") tambem nao.
+
+    Returns:
+        (cobertura entre 0 e 1, numero de palavras da ementa cobertas)
+    """
+    if len(palavras_ementa) < ngram or len(palavras_chunk) < ngram:
+        return 0.0, 0
+    blocos_chunk = _shingles(palavras_chunk, ngram)
+    coberta = [False] * len(palavras_ementa)
+    for i in range(len(palavras_ementa) - ngram + 1):
+        if tuple(palavras_ementa[i : i + ngram]) in blocos_chunk:
+            for j in range(i, i + ngram):
+                coberta[j] = True
+    n_cobertas = sum(coberta)
+    return n_cobertas / len(palavras_ementa), n_cobertas
+
+
 def classificar_contaminacao(
     ementa: str,
     texto_chunk: str,
     trecho_minimo: int = 200,
     min_chunk_na_ementa: int = 100,
+    limiar_cobertura: Optional[float] = 0.30,
+    min_palavras_cobertura: int = 12,
+    ngram_cobertura: int = 6,
 ) -> Optional[str]:
     """
     Classifica se o chunk contem vazamento espurio do texto da ementa.
@@ -51,49 +88,90 @@ def classificar_contaminacao(
       - "chunk_na_ementa": O chunk e curto e esta contido dentro da ementa.
       - "trecho": Uma janela contigua longa (>= trecho_minimo caracteres) da ementa
         esta presente de forma identica dentro do chunk.
+      - "cobertura": Pelo menos `limiar_cobertura` das palavras da ementa (e no minimo
+        `min_palavras_cobertura`) aparecem copiadas no chunk, mesmo que em pedacos.
+        limiar_cobertura=None desliga este criterio.
     """
-    consulta = remover_rotulos_iniciais(normalizar_texto_auditoria(ementa))
+    motivo, _ = _classificar(
+        remover_rotulos_iniciais(normalizar_texto_auditoria(ementa)),
+        texto_chunk,
+        trecho_minimo,
+        min_chunk_na_ementa,
+        limiar_cobertura,
+        min_palavras_cobertura,
+        ngram_cobertura,
+    )
+    return motivo
+
+
+def _classificar(
+    consulta: str,
+    texto_chunk: str,
+    trecho_minimo: int,
+    min_chunk_na_ementa: int,
+    limiar_cobertura: Optional[float],
+    min_palavras_cobertura: int,
+    ngram_cobertura: int,
+) -> tuple[Optional[str], float]:
+    """Recebe a ementa ja normalizada. Devolve (motivo, cobertura)."""
     chunk = remover_rotulos_iniciais(normalizar_texto_auditoria(texto_chunk))
 
     if not consulta or not chunk:
-        return None
+        return None, 0.0
+
+    cobertura, n_cobertas = cobertura_ementa(consulta.split(), chunk.split(), ngram_cobertura)
 
     if consulta in chunk:
-        return "inteira"
+        return "inteira", cobertura
 
     if len(chunk) >= min_chunk_na_ementa and chunk in consulta:
-        return "chunk_na_ementa"
+        return "chunk_na_ementa", cobertura
 
-    if len(consulta) < trecho_minimo or len(chunk) < trecho_minimo:
-        return None
+    if len(consulta) >= trecho_minimo and len(chunk) >= trecho_minimo:
+        # Verificacao por janela deslizante de caracteres
+        janelas = {
+            chunk[i : i + trecho_minimo]
+            for i in range(len(chunk) - trecho_minimo + 1)
+        }
+        for i in range(len(consulta) - trecho_minimo + 1):
+            if consulta[i : i + trecho_minimo] in janelas:
+                return "trecho", cobertura
 
-    # Verificacao por janela deslizante de caracteres
-    janelas = {
-        chunk[i : i + trecho_minimo]
-        for i in range(len(chunk) - trecho_minimo + 1)
-    }
-    for i in range(len(consulta) - trecho_minimo + 1):
-        if consulta[i : i + trecho_minimo] in janelas:
-            return "trecho"
+    if (
+        limiar_cobertura is not None
+        and cobertura >= limiar_cobertura
+        and n_cobertas >= min_palavras_cobertura
+    ):
+        return "cobertura", cobertura
 
-    return None
+    return None, cobertura
 
 
 def auditar_e_marcar_chunks(
     processo: ProcessoJudicial,
     chunks: list[ChunkProcesso],
     trecho_minimo: int = 200,
+    limiar_cobertura: Optional[float] = 0.30,
+    min_palavras_cobertura: int = 12,
+    ngram_cobertura: int = 6,
 ) -> list[ChunkProcesso]:
     """
     Analisa todos os chunks de um determinado processo judicial, marcando
-    os campos 'contem_vazamento_ementa' e 'motivo_vazamento'.
+    os campos 'contem_vazamento_ementa', 'motivo_vazamento' e 'cobertura_ementa'.
     """
+    # A ementa e normalizada uma vez por processo, nao uma vez por chunk.
+    consulta = remover_rotulos_iniciais(normalizar_texto_auditoria(processo.ementa))
     for ch in chunks:
-        motivo = classificar_contaminacao(
-            ementa=processo.ementa,
-            texto_chunk=ch.texto,
-            trecho_minimo=trecho_minimo,
+        motivo, cobertura = _classificar(
+            consulta,
+            ch.texto,
+            trecho_minimo,
+            100,
+            limiar_cobertura,
+            min_palavras_cobertura,
+            ngram_cobertura,
         )
+        ch.cobertura_ementa = round(cobertura, 4)
         if motivo is not None:
             ch.contem_vazamento_ementa = True
             ch.motivo_vazamento = motivo
@@ -112,6 +190,18 @@ def gerar_relatorio_auditoria(chunks: list[ChunkProcesso]) -> dict:
     por_motivo = Counter(c.motivo_vazamento for c in chunks if c.contem_vazamento_ementa)
     por_chunk_idx = Counter(c.chunk_idx for c in chunks if c.contem_vazamento_ementa)
 
+    # Processos sem nenhum chunk limpo saem da avaliacao: o numero entra no texto do TCC.
+    limpos_por_processo: Counter = Counter()
+    for c in chunks:
+        limpos_por_processo[c.id_global_processo] += 0 if c.contem_vazamento_ementa else 1
+    processos_sem_chunk_limpo = sum(1 for n in limpos_por_processo.values() if n == 0)
+
+    # Histograma da cobertura, para justificar o limiar escolhido.
+    histograma: dict[str, int] = {}
+    for inicio, fim in zip(_FAIXAS_COBERTURA, _FAIXAS_COBERTURA[1:]):
+        rotulo = f"[{inicio:.2f}, {min(fim, 1.0):.2f}{']' if fim > 1 else ')'}"
+        histograma[rotulo] = sum(1 for c in chunks if inicio <= c.cobertura_ementa < fim)
+
     return {
         "total_chunks": total,
         "limpos": limpos,
@@ -119,4 +209,7 @@ def gerar_relatorio_auditoria(chunks: list[ChunkProcesso]) -> dict:
         "taxa_contaminacao": round(contaminados / max(1, total), 4),
         "motivos": dict(por_motivo),
         "distribuicao_por_indice_chunk": {f"chunk_{k}": v for k, v in sorted(por_chunk_idx.items())},
+        "total_processos": len(limpos_por_processo),
+        "processos_sem_chunk_limpo": processos_sem_chunk_limpo,
+        "histograma_cobertura": histograma,
     }

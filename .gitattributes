@@ -1,0 +1,3 @@
+# Scripts do cluster rodam no Linux: sempre LF, mesmo com core.autocrlf no Windows
+*.sh  text eol=lf
+*.pbs text eol=lf

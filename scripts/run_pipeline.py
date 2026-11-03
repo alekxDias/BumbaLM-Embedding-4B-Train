@@ -7,7 +7,11 @@ Permite executar o pipeline completo de ponta a ponta ou etapas especificas:
   - chunk : 02_generate_chunks.py (Fragmentacao em janelas de tokens e auditoria de Chunk 0)
   - mine  : 03_mine_negatives.py (Mineracao acelerada em GPU de hard negatives)
   - train : 04_train.py (Fine-tuning contrastivo com telemetria cientifica)
+  - random: 03b_random_negatives.py (Mesmas tuplas com negativos aleatorios, para a ablacao)
   - eval  : 05_evaluate.py (Avaliacao e comparativo com baseline)
+
+0. Ablacao do TCC: tres variantes de negativos e comparacao com o modelo base:
+   python scripts/run_pipeline.py --all --negativos nenhum,aleatorios,dificeis --compare_baseline
 
 1. Execucao completa de ponta a ponta:
    python scripts/run_pipeline.py --all
@@ -58,11 +62,12 @@ ETAPAS_DISPONIVEIS = {
     "split": BASE_DIR / "scripts" / "01_prepare_and_split.py",
     "chunk": BASE_DIR / "scripts" / "02_generate_chunks.py",
     "mine": BASE_DIR / "scripts" / "03_mine_negatives.py",
+    "random": BASE_DIR / "scripts" / "03b_random_negatives.py",
     "train": BASE_DIR / "scripts" / "04_train.py",
     "eval": BASE_DIR / "scripts" / "05_evaluate.py",
 }
 
-ORDEM_PADRAO = ["split", "chunk", "mine", "train", "eval"]
+ORDEM_PADRAO = ["split", "chunk", "mine", "random", "train", "eval"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -146,6 +151,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="GPUs das etapas mine e train. Ex.: '1' ou '0,1'.",
     )
+    parser.add_argument(
+        "--negativos",
+        type=str,
+        default="dificeis",
+        help="Variantes da etapa train, separadas por virgula: dificeis, aleatorios, nenhum.",
+    )
+    parser.add_argument(
+        "--limite_tuplas",
+        type=int,
+        default=None,
+        help="Numero de tuplas sorteadas na etapa train (mesma semente em todas as variantes).",
+    )
+    parser.add_argument(
+        "--config_base",
+        type=Path,
+        default=None,
+        help="config_base.yaml repassado a todas as etapas. Ex.: configs/config_base_smoke.yaml.",
+    )
     return parser.parse_args()
 
 
@@ -218,9 +241,20 @@ def main() -> None:
 
     tempo_inicio_total = time.time()
 
+    # A etapa train roda uma vez por variante de negativos
+    variantes = [v.strip() for v in str(args.negativos).split(",") if v.strip()]
+    execucoes: list[tuple[str, str | None]] = []
     for etapa in etapas_selecionadas:
+        if etapa == "train":
+            execucoes.extend(("train", v) for v in variantes)
+        else:
+            execucoes.append((etapa, None))
+
+    for etapa, variante in execucoes:
         script_path = str(ETAPAS_DISPONIVEIS[etapa])
         cmd = [python_bin, script_path]
+        if args.config_base:
+            cmd.extend(["--config_base", str(args.config_base)])
 
         if etapa == "split":
             if args.input:
@@ -229,13 +263,14 @@ def main() -> None:
                 cmd.extend(["--max_por_tribunal", str(args.max_por_tribunal)])
 
         if etapa == "mine":
-            if args.batch_size:
-                cmd.extend(["--batch_size", str(args.batch_size)])
-            # A mineracao reparte vetorizacao e busca. Nao usa o torchrun do treino.
+            # O batch da mineracao vem de config_data.yaml. A mineracao nao usa o torchrun do treino.
             if args.gpus:
                 cmd.extend(["--gpus", args.gpus])
 
         if etapa == "train":
+            cmd.extend(["--negativos", variante])
+            if args.limite_tuplas:
+                cmd.extend(["--limite_tuplas", str(args.limite_tuplas)])
             if args.batch_size:
                 cmd.extend(["--batch_size", str(args.batch_size)])
             if args.mini_batch_size:
@@ -256,7 +291,7 @@ def main() -> None:
             if args.batch_size:
                 cmd.extend(["--batch_size", str(args.batch_size)])
 
-        sucesso = executar_comando(cmd, etapa)
+        sucesso = executar_comando(cmd, f"{etapa}:{variante}" if variante else etapa)
         if not sucesso:
             print(f"Pipeline abortado devido a falha na etapa [{etapa}].")
             sys.exit(1)

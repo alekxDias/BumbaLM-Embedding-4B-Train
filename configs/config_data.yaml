@@ -24,6 +24,21 @@ chunking:
   # Auditoria de vazamento do Chunk 0
   auditar_vazamento_ementa: true
   min_caracteres_contaminacao: 200
+  # Copia parcial: fracao das palavras da ementa copiada no chunk, em blocos de N palavras.
+  # Pega a ementa cortada na borda do chunk ou interrompida por rodape/numeracao.
+  # Calibre com o histograma de relatorio_auditoria_chunks.txt. null desliga.
+  limiar_cobertura_ementa: 0.30
+  min_palavras_cobertura: 12
+  ngram_cobertura: 6
+
+# Casos quase duplicados (litigancia em massa): ementas com Jaccard >= limiar
+# ficam no mesmo grupo, no mesmo split, e nao viram negativos umas das outras.
+# Em blocos de 5 palavras, trocar UMA palavra numa ementa de 150 ja leva o Jaccard a ~0,87;
+# nomes e valores diferentes descem mais. Calibre com o histograma de relatorio_preparacao_splits.txt.
+quase_duplicatas:
+  ativo: true
+  limiar_jaccard: 0.80
+  ngram: 5
 
 mineracao_negativos:
   n_negativos: 5
@@ -32,5 +47,6 @@ mineracao_negativos:
   top_k_candidatos: 200
   
   # Lotes de mineracao acelerada em GPU
-  encode_batch_size: 256
+  # 64 cabe na V100 de 32 GB com textos de 768 tokens. Na H200 da para subir a 256.
+  encode_batch_size: 64
   query_batch_size: 256

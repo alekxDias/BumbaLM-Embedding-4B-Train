@@ -35,7 +35,10 @@ class ProcessoJudicial:
     ementa: str
     inteiro_teor: str
     metadados: dict[str, Any] = field(default_factory=dict)
-    
+    # Processos com ementas quase identicas dividem o mesmo grupo e ficam no mesmo split.
+    # Vazio: grupo e o proprio id_global.
+    grupo_duplicata: str = ""
+
     # Identificador exclusivo: {tribunal}_{numero} se houver tribunal, senao apenas {numero}
     id_global: str = field(init=False)
 
@@ -48,6 +51,7 @@ class ProcessoJudicial:
             self.id_global = num_norm if num_norm else "sem_numero"
         self.ementa = str(self.ementa or "").strip()
         self.inteiro_teor = str(self.inteiro_teor or "").strip()
+        self.grupo_duplicata = str(self.grupo_duplicata or "").strip() or self.id_global
 
     @property
     def id(self) -> str:
@@ -62,6 +66,7 @@ class ProcessoJudicial:
             "str_ementa": self.ementa,
             "str_inteiro_teor": self.inteiro_teor,
             "metadados": self.metadados,
+            "grupo_duplicata": self.grupo_duplicata,
         }
 
     @classmethod
@@ -73,6 +78,7 @@ class ProcessoJudicial:
             ementa=data.get("str_ementa", data.get("ementa", "")),
             inteiro_teor=data.get("str_inteiro_teor", data.get("inteiro_teor", "")),
             metadados=data.get("metadados", {}),
+            grupo_duplicata=data.get("grupo_duplicata", ""),
         )
 
 
@@ -90,6 +96,8 @@ class ChunkProcesso:
     texto: str
     contem_vazamento_ementa: bool = False
     motivo_vazamento: Optional[str] = None
+    # Fracao das palavras da ementa copiadas neste chunk (leakage_audit.cobertura_ementa).
+    cobertura_ementa: float = 0.0
 
     @property
     def processo_id(self) -> str:
@@ -115,6 +123,7 @@ class ChunkProcesso:
             "texto": self.texto,
             "contem_vazamento_ementa": self.contem_vazamento_ementa,
             "motivo_vazamento": self.motivo_vazamento,
+            "cobertura_ementa": self.cobertura_ementa,
         }
 
     @classmethod
@@ -130,4 +139,5 @@ class ChunkProcesso:
             texto=data.get("texto", ""),
             contem_vazamento_ementa=bool(data.get("contem_vazamento_ementa", data.get("is_ementa_leak", False))),
             motivo_vazamento=data.get("motivo_vazamento", data.get("motivo_leak")),
+            cobertura_ementa=float(data.get("cobertura_ementa", 0.0) or 0.0),
         )

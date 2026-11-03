@@ -7,13 +7,48 @@ from __future__ import annotations
 import gc
 import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from sentence_transformers import SentenceTransformer, models
 
+from src.hardware import dtype_para_dispositivo
+
 
 log = logging.getLogger("bumbalm_model_builder")
+
+# Projecoes de atencao e MLP do Qwen3.
+LORA_ALVOS_PADRAO = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+
+def _aplicar_lora(modelo: SentenceTransformer, cfg_lora: dict[str, Any], rank: str) -> None:
+    """
+    Adiciona adaptadores LoRA ao Transformer e congela o restante.
+    Os pesos do LoRA ficam em float32: o GradScaler do fp16 nao aceita gradiente em fp16.
+    """
+    try:
+        from peft import LoraConfig, TaskType
+    except ImportError as exc:
+        raise ImportError("LoRA ativado no config_train.yaml, mas o pacote 'peft' nao esta instalado.") from exc
+
+    config = LoraConfig(
+        task_type=TaskType.FEATURE_EXTRACTION,
+        r=int(cfg_lora.get("r", 16)),
+        lora_alpha=int(cfg_lora.get("alpha", 32)),
+        lora_dropout=float(cfg_lora.get("dropout", 0.05)),
+        target_modules=list(cfg_lora.get("target_modules") or LORA_ALVOS_PADRAO),
+        bias="none",
+    )
+    # add_adapter do SentenceTransformer: os checkpoints salvos ja sabem carregar o adaptador.
+    modelo.add_adapter(config)
+
+    for param in modelo.parameters():
+        if param.requires_grad and param.dtype != torch.float32:
+            param.data = param.data.float()
+
+    if rank == "0":
+        print(f"  - LoRA                 : r={config.r} | alpha={config.lora_alpha} | dropout={config.lora_dropout}")
+        print(f"  - Modulos LoRA         : {', '.join(sorted(config.target_modules))}")
 
 
 def construir_modelo_embedding(
@@ -22,10 +57,12 @@ def construir_modelo_embedding(
     attn_implementation: str = "sdpa",
     gradient_checkpointing: bool = False,
     device: Optional[str] = None,
+    precisao: str = "auto",
+    lora: Optional[dict[str, Any]] = None,
 ) -> SentenceTransformer:
     """
-    Instancia e configura o pipeline SentenceTransformer para Full Fine-Tuning:
-    1. Camada Transformer: Base Qwen3 com precisao bfloat16 e atencao acelerada.
+    Instancia e configura o pipeline SentenceTransformer:
+    1. Camada Transformer: Base Qwen3 com precisao conforme a GPU e atencao acelerada.
     2. Camada Pooling: Modo 'lasttoken'.
     3. Camada Normalize: Projecao na esfera unitaria L2.
 
@@ -34,8 +71,10 @@ def construir_modelo_embedding(
         max_seq_length: Comprimento maximo de tokens por texto (padrao: 768).
         attn_implementation: Mecanismo de atencao ('sdpa' ou 'flash_attention_2').
         gradient_checkpointing: Se True, economiza VRAM recalculando ativacoes no backward.
-            Na GPU H200 (141 GB), manter False acelera o treino em ate 35%.
+            Na V100 (32 GB) e obrigatorio. Na H200 (141 GB), manter False acelera o treino.
         device: Dispositivo de execucao ('cuda', 'cuda:0', 'cuda:1' ou 'cpu').
+        precisao: "auto", "bf16", "fp16" ou "fp32". "auto" usa fp16 na V100 e bf16 da Ampere em diante.
+        lora: Configuracao do LoRA ({"ativo": True, "r": 16, ...}). None ou ativo=False faz Full Fine-Tuning.
 
     Returns:
         Instancia de SentenceTransformer pronta para fine-tuning.
@@ -47,17 +86,22 @@ def construir_modelo_embedding(
     if em_cuda and ":" in str(device):
         torch.cuda.set_device(int(str(device).split(":", 1)[1]))
 
-    dtype_modelo = torch.bfloat16 if em_cuda and torch.cuda.is_bf16_supported() else (torch.float16 if em_cuda else torch.float32)
+    usar_lora = bool(lora and lora.get("ativo", False))
+    dtype_modelo = dtype_para_dispositivo(device, precisao)
+    # Full fine-tuning em fp16 precisa dos pesos mestres em fp32. So o LoRA mantem a base em fp16.
+    if dtype_modelo == torch.float16 and not usar_lora:
+        dtype_modelo = torch.float32
 
     rank = os.environ.get("RANK", "0")
     print(f"[rank {rank}] Construindo modelo em {device}", flush=True)
     if rank == "0":
         print(f"Construindo modelo base: {model_id} ...")
         print(f"  - Dispositivo          : {device}")
-        print(f"  - Precisao             : {dtype_modelo}")
+        print(f"  - Precisao dos pesos   : {dtype_modelo}")
         print(f"  - Comprimento Maximo   : {max_seq_length} tokens")
         print(f"  - Atencao Otimizada    : {attn_implementation}")
         print(f"  - Gradient Checkpoint  : {gradient_checkpointing}")
+        print(f"  - Estrategia           : {'LoRA' if usar_lora else 'Full Fine-Tuning'}")
 
     gc.collect()
     if torch.cuda.is_available():
@@ -84,9 +128,10 @@ def construir_modelo_embedding(
         if rank == "0":
             print("  - Gradient Checkpointing ativado com sucesso.")
     elif rank == "0":
-        print("  - Gradient Checkpointing desativado (priorizando velocidade na H200).")
+        print("  - Gradient Checkpointing desativado.")
 
-    # 3. Full Fine-Tuning: Habilita gradientes em 100% dos parametros do Transformer
+    # 3. Full Fine-Tuning: Habilita gradientes em 100% dos parametros do Transformer.
+    # Com LoRA, o add_adapter congela a base logo abaixo.
     for param in word_embedding_model.auto_model.parameters():
         param.requires_grad = True
 
@@ -105,11 +150,15 @@ def construir_modelo_embedding(
         device=device,
     )
 
+    if usar_lora:
+        _aplicar_lora(modelo, lora, rank)
+
     total_params = sum(p.numel() for p in word_embedding_model.auto_model.parameters())
     trainable_params = sum(p.numel() for p in word_embedding_model.auto_model.parameters() if p.requires_grad)
     pct_treinavel = 100 * trainable_params / max(1, total_params)
 
     if rank == "0":
-        print(f"Modelo estruturado com sucesso: {trainable_params:,} parametros treinaveis ({pct_treinavel:.1f}% - Full Fine-Tuning)")
+        estrategia = "LoRA" if usar_lora else "Full Fine-Tuning"
+        print(f"Modelo estruturado com sucesso: {trainable_params:,} parametros treinaveis ({pct_treinavel:.2f}% - {estrategia})")
 
     return modelo

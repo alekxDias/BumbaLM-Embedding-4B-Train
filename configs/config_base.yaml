@@ -8,25 +8,28 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
-  diretorio_processados: "data/processed_2gpu"
-  
+  # Cluster tapajos: pares do TJMA do TCC
+  diretorio_base_pares: "/projetos/ctcca/nlp/dados_tjma"
+  diretorio_processados: "data/processed_tjma"
+
   # Lista explicita dos arquivos de pares para processamento.
   # Comente ou descomente as linhas para incluir ou excluir tribunais:
   arquivos_pares:
-    # --- TRIBUNAIS DE JUSTICA ESTADUAIS (ATIVOS PARA O PRIMEIRO TESTE) ---
-    - "pares_tjba.jsonl"
-    - "pares_tjdf.jsonl"
-    - "pares_tjes.jsonl"
+    # --- TCC: ablacao de negativos so com o TJMA ---
     - "pares_tjma.jsonl"
-    - "pares_tjms.jsonl"
-    - "pares_tjpa.jsonl"
-    - "pares_tjpb.jsonl"
-    - "pares_tjpr.jsonl"
-    - "pares_tjrn.jsonl"
-    - "pares_tjro.jsonl"
-    - "pares_tjrr.jsonl"
-    - "pares_tjrs.jsonl"
+
+    # --- TRIBUNAIS DE JUSTICA ESTADUAIS (rodada multi-tribunal, desativados no TCC) ---
+    # - "pares_tjba.jsonl"
+    # - "pares_tjdf.jsonl"
+    # - "pares_tjes.jsonl"
+    # - "pares_tjms.jsonl"
+    # - "pares_tjpa.jsonl"
+    # - "pares_tjpb.jsonl"
+    # - "pares_tjpr.jsonl"
+    # - "pares_tjrn.jsonl"
+    # - "pares_tjro.jsonl"
+    # - "pares_tjrr.jsonl"
+    # - "pares_tjrs.jsonl"
 
     # --- TRIBUNAIS SUPERIORES E ESPECIALIZADOS (DESATIVADOS NESTE TESTE) ---
     # - "pares_stf.jsonl"
@@ -46,5 +49,7 @@ dados:
 # Diretorios de Saida de Modelos e Logs
 saidas:
   diretorio_experimentos: "experiments"
-  nome_experimento: "exp_003_h200_4b_2gpu"
-  hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"
+  # Cada variante de negativos grava em experiments/<nome_experimento>/<variante>/
+  nome_experimento: "tcc_tjma_ablacao_negativos"
+  # Informativo: o cache real vem da variavel HF_HOME, definida em cluster/env.sh
+  hf_cache_dir: "/projetos/ctcca/nlp/hf_cache"

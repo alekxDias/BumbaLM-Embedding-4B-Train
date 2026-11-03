@@ -4,17 +4,21 @@ Pipeline BumbaLM - Etapa 4: Treinamento Contrastivo do Modelo.
 
 Executa:
 1. Leitura dos hiperparametros de treinamento e hardware ('config_train.yaml').
-2. Construcao da arquitetura do Qwen3-Embedding-4B (Full Fine-Tuning sem LoRA).
-3. Carregamento dos tripletos minerados ('train_triplets.jsonl').
+2. Construcao da arquitetura do Qwen3-Embedding-4B (Full Fine-Tuning ou LoRA, conforme o YAML).
+3. Carregamento das tuplas da variante escolhida em --negativos:
+   - dificeis  : 'train_triplets.jsonl' (5 hard negatives minerados na Etapa 3)
+   - aleatorios: 'train_tuplas_aleatorias.jsonl' (mesmos pares, 5 negativos sorteados na Etapa 3b)
+   - nenhum    : mesmos pares de 'train_triplets.jsonl', sem negativos explicitos (so os do lote)
 4. Configuracao da CachedMultipleNegativesRankingLoss e do SentenceTransformerTrainer.
 5. Execucao do fine-tuning com telemetria cientifica de hardware em tempo real.
-6. Salvamento do melhor modelo consolidado em disco ('best_model_4b/').
+6. Salvamento do modelo em experiments/<nome_experimento>/<negativos>/ e do caminho do
+   melhor checkpoint em 'melhor_checkpoint.json'.
 
 Uso:
-    python scripts/04_train.py
-    python scripts/04_train.py --gpus 1
+    python scripts/04_train.py --negativos dificeis
+    python scripts/04_train.py --negativos nenhum
+    python scripts/04_train.py --negativos aleatorios --limite_tuplas 50000
     python scripts/04_train.py --gpus 0,1
-    python scripts/04_train.py --batch_size 128 --epochs 1
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import json
 import random
 import subprocess
 import sys
@@ -68,6 +73,15 @@ if hasattr(_tf_trainer.Trainer, "_load_rng_state"):
 from src.training.model_builder import construir_modelo_embedding
 from src.training.trainer import carregar_dataset_tripletos, configurar_treinador
 from src.evaluation.ir_evaluator import criar_ir_evaluator
+from src.hardware import dtype_para_dispositivo
+
+
+# Variante de negativos -> (arquivo de tuplas, negativos por tupla). None usa o n_negativos do YAML.
+VARIANTES_NEGATIVOS = {
+    "dificeis": ("train_triplets.jsonl", None),
+    "aleatorios": ("train_tuplas_aleatorias.jsonl", None),
+    "nenhum": ("train_triplets.jsonl", 0),
+}
 
 
 def carregar_yaml(caminho: Path) -> dict[str, Any]:
@@ -162,16 +176,35 @@ def parse_args() -> argparse.Namespace:
         help="Caminho do config_train.yaml",
     )
     parser.add_argument(
+        "--config_data",
+        type=Path,
+        default=BASE_DIR / "configs" / "config_data.yaml",
+        help="Caminho do config_data.yaml (n_negativos).",
+    )
+    parser.add_argument(
+        "--negativos",
+        type=str,
+        choices=sorted(VARIANTES_NEGATIVOS),
+        default="dificeis",
+        help="Variante da ablacao: dificeis, aleatorios ou nenhum (so negativos do lote).",
+    )
+    parser.add_argument(
+        "--limite_tuplas",
+        type=int,
+        default=None,
+        help="Sorteia este numero de tuplas (mesma semente em todas as variantes). Sobrescreve treinamento.limite_tuplas.",
+    )
+    parser.add_argument(
         "--triplets_file",
         type=Path,
         default=None,
-        help="Caminho do arquivo train_triplets.jsonl gerado na Etapa 3.",
+        help="Caminho do arquivo de tuplas. Padrao: o arquivo da variante em --negativos.",
     )
     parser.add_argument(
         "--output_dir",
         type=Path,
         default=None,
-        help="Diretorio de saida do experimento e modelo treinado.",
+        help="Diretorio de saida. Padrao: experiments/<nome_experimento>/<negativos>.",
     )
     parser.add_argument(
         "--batch_size",
@@ -228,6 +261,7 @@ def main() -> None:
 
     cfg_base = carregar_yaml(args.config_base)
     cfg_train = carregar_yaml(args.config_train)
+    cfg_data = carregar_yaml(args.config_data) if args.config_data.is_file() else {}
     _preparar_gpus(_resolver_gpus(args, cfg_train))
 
     seed = cfg_base.get("projeto", {}).get("seed", 42)
@@ -241,14 +275,20 @@ def main() -> None:
     if not dir_processados.is_absolute():
         dir_processados = BASE_DIR / dir_processados
 
-    caminho_tripletos = args.triplets_file or (dir_processados / "train_triplets.jsonl")
+    arquivo_variante, n_neg_variante = VARIANTES_NEGATIVOS[args.negativos]
+    n_negativos = (
+        n_neg_variante
+        if n_neg_variante is not None
+        else int(cfg_data.get("mineracao_negativos", {}).get("n_negativos", 5))
+    )
+    caminho_tripletos = args.triplets_file or (dir_processados / arquivo_variante)
     if not Path(caminho_tripletos).is_absolute():
         caminho_tripletos = BASE_DIR / caminho_tripletos
 
-    # Diretorio de saida do experimento
+    # Diretorio de saida: uma pasta por variante dentro do experimento
     exp_dir_base = Path(cfg_base.get("saidas", {}).get("diretorio_experimentos", "experiments"))
     exp_nome = cfg_base.get("saidas", {}).get("nome_experimento", "exp_001_h200_4b")
-    dir_saida = args.output_dir or (exp_dir_base / exp_nome)
+    dir_saida = args.output_dir or (exp_dir_base / exp_nome / args.negativos)
     if not Path(dir_saida).is_absolute():
         dir_saida = BASE_DIR / dir_saida
     dir_saida.mkdir(parents=True, exist_ok=True)
@@ -272,7 +312,11 @@ def main() -> None:
     weight_decay = train_cfg.get("weight_decay", 0.01)
     epochs = args.epochs or train_cfg.get("num_epochs", 1)
     warmup_ratio = train_cfg.get("warmup_ratio", 0.05)
-    bf16 = train_cfg.get("bf16", True)
+    precisao = str(train_cfg.get("precisao", "auto"))
+    limite_tuplas = args.limite_tuplas or train_cfg.get("limite_tuplas")
+    save_total_limit = int(train_cfg.get("save_total_limit", 2))
+    cfg_lora = cfg_train.get("lora", {}) or {}
+    usar_lora = bool(cfg_lora.get("ativo", False))
     grad_checkpointing = train_cfg.get("gradient_checkpointing", False)
     num_workers = train_cfg.get("dataloader_num_workers", 4)
     pin_memory = train_cfg.get("dataloader_pin_memory", False)
@@ -283,16 +327,22 @@ def main() -> None:
     dispositivo = _dispositivo_local()
     num_processos = max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
+    # bf16 na A100/H200; fp16 na V100. O Trainer usa a mesma escolha na precisao mista.
+    dtype_alvo = dtype_para_dispositivo(dispositivo, precisao)
+    precisao_mista = {torch.bfloat16: "bf16", torch.float16: "fp16"}.get(dtype_alvo, "no")
+
     _imprimir("=" * 64)
-    _imprimir("BumbaLM - Etapa 4: Treinamento Contrastivo em GPU H200")
+    _imprimir("BumbaLM - Etapa 4: Treinamento Contrastivo")
     _imprimir("=" * 64)
+    _imprimir(f"Variante de Negativos: {args.negativos} ({n_negativos} por tupla)")
     _imprimir(f"Arquivo de Tripletos : {caminho_tripletos}")
     _imprimir(f"Diretorio de Saida   : {dir_saida}")
     _imprimir(f"Modelo de Base       : {model_id}")
     _imprimir(f"GPUs no passo        : {num_processos} | Dispositivo local: {dispositivo}")
     _imprimir(f"Batch por GPU        : {batch_size} (Acumulacao: {grad_accum})")
     _imprimir(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
-    _imprimir(f"Precisao bfloat16    : {bf16} | Atencao: {attn_impl}")
+    _imprimir(f"Precisao mista       : {precisao_mista} | Atencao: {attn_impl}")
+    _imprimir(f"LoRA                 : {usar_lora} | Limite de tuplas: {limite_tuplas or 'todas'}")
     _imprimir(f"Dataloader Workers   : {num_workers} | Pin Memory: {pin_memory}")
     _imprimir("-" * 64)
 
@@ -303,13 +353,17 @@ def main() -> None:
         attn_implementation=attn_impl,
         gradient_checkpointing=grad_checkpointing,
         device=dispositivo,
+        precisao=precisao,
+        lora=cfg_lora,
     )
 
     # 2. Carregamento do Dataset de Tripletos
     train_dataset = carregar_dataset_tripletos(
         caminho_arquivo=caminho_tripletos,
-        n_negativos=5,
+        n_negativos=n_negativos,
         query_instruction=query_instruction,
+        limite_tuplas=limite_tuplas,
+        seed=seed,
     )
 
     # 3. Construcao do Avaliador de Validacao (InformationRetrievalEvaluator)
@@ -321,7 +375,9 @@ def main() -> None:
             arq_val_chunks = dir_processados / "validacao_corpus_chunks.jsonl"
 
         if arq_val_processos.is_file() and arq_val_chunks.is_file():
-            eval_batch_size = cfg_train.get("avaliacao", {}).get("eval_batch_size", 128)
+            cfg_avaliacao = cfg_train.get("avaliacao", {})
+            eval_batch_size = cfg_avaliacao.get("eval_batch_size", 128)
+            max_processos_val = cfg_avaliacao.get("max_processos_val")
             _imprimir("Configurando InformationRetrievalEvaluator sobre o split de validacao...")
             evaluator = criar_ir_evaluator(
                 caminho_processos=arq_val_processos,
@@ -331,6 +387,8 @@ def main() -> None:
                 excluir_chunks_contaminados=True,
                 batch_size=eval_batch_size,
                 show_progress_bar=False,
+                limite_processos=max_processos_val,
+                seed=seed,
             )
             _imprimir("  - Avaliador de validacao pronto (chunks com vazamento de ementa excluidos).")
         else:
@@ -339,8 +397,9 @@ def main() -> None:
         _imprimir("Flag --no_eval detectada: Avaliacao intermediaria desativada.")
 
     # 4. Configuracao do Trainer e Telemetria
-    metric_best = cfg_train.get("metric_for_best_model", "val_cosine_ndcg@10")
-    greater_is_better = cfg_train.get("greater_is_better", True)
+    # As chaves ficam em treinamento: no YAML. A leitura antiga no topo sempre caia no padrao.
+    metric_best = train_cfg.get("metric_for_best_model", cfg_train.get("metric_for_best_model", "val_cosine_ndcg@10"))
+    greater_is_better = train_cfg.get("greater_is_better", cfg_train.get("greater_is_better", True))
     if args.eval_steps is not None:
         eval_steps = args.eval_steps
 
@@ -357,13 +416,17 @@ def main() -> None:
         warmup_ratio=warmup_ratio,
         eval_steps=eval_steps,
         save_steps=save_steps,
-        bf16=bf16,
+        precisao_mista=precisao_mista,
         dataloader_num_workers=num_workers,
         dataloader_pin_memory=pin_memory,
         scale=loss_scale,
         evaluator=evaluator,
         metric_for_best_model=metric_best,
         greater_is_better=greater_is_better,
+        save_total_limit=save_total_limit,
+        # Com LoRA o checkpoint guarda so o adaptador. O melhor e avaliado pelo caminho, na Etapa 5.
+        carregar_melhor_no_fim=not usar_lora,
+        seed=seed,
     )
 
     # 4. Execucao do Fine-Tuning
@@ -390,12 +453,34 @@ def main() -> None:
     # 5. Salvamento do Modelo Final (somente o processo da primeira GPU)
     if _processo_principal():
         modelo_salvar = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
-        best_model_path = dir_saida / "best_model_4b"
+        # Sem LoRA, load_best_model_at_end ja trouxe o melhor. Com LoRA, este e o ultimo passo.
+        nome_final = "modelo_final" if usar_lora else "best_model_4b"
+        best_model_path = dir_saida / nome_final
         modelo_salvar.save(str(best_model_path))
+
+        melhor_ckpt = trainer.state.best_model_checkpoint
+        registro = {
+            "variante_negativos": args.negativos,
+            "n_negativos": n_negativos,
+            "arquivo_tuplas": str(caminho_tripletos),
+            "n_tuplas_treino": len(train_dataset),
+            "lora": usar_lora,
+            "precisao_mista": precisao_mista,
+            "metrica_selecao": metric_best,
+            "melhor_metrica": trainer.state.best_metric,
+            "melhor_checkpoint": melhor_ckpt,
+            "modelo_final": str(best_model_path),
+            # A Etapa 5 avalia este caminho.
+            "modelo_para_avaliar": str(melhor_ckpt) if (usar_lora and melhor_ckpt) else str(best_model_path),
+        }
+        (dir_saida / "melhor_checkpoint.json").write_text(
+            json.dumps(registro, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
         print("=" * 64)
         print("Treinamento concluido com sucesso!")
-        print(f"Melhor modelo persistido em: {best_model_path}")
+        print(f"Modelo final persistido em : {best_model_path}")
+        print(f"Modelo para a Etapa 5      : {registro['modelo_para_avaliar']}")
         print(f"Relatorio executivo JSON   : {telemetry.json_path}")
         print(f"Metricas tabulares CSV     : {telemetry.csv_path}")
         print("=" * 64)

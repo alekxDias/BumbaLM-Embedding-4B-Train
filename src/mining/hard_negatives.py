@@ -19,6 +19,7 @@ from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 
 from src.data.schema import ChunkProcesso, ProcessoJudicial
+from src.hardware import dtype_para_dispositivo
 
 
 DEFAULT_QUERY_INSTRUCTION = (
@@ -55,7 +56,8 @@ def carregar_modelo_mineracao(
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dtype_modelo = torch.bfloat16 if device == "cuda" and torch.cuda.is_bf16_supported() else (torch.float16 if device == "cuda" else torch.float32)
+    # V100 nao tem bf16 nativo: usa fp16. A100/H200 seguem em bf16.
+    dtype_modelo = dtype_para_dispositivo(device)
 
     print(f"Carregando modelo de mineracao: {model_id} no dispositivo: {device} (dtype: {dtype_modelo})...")
     modelo = SentenceTransformer(
@@ -332,7 +334,14 @@ def _mascarar_mesmo_processo(
     n_local: int,
     batch_procs: list[ProcessoJudicial],
     indices_por_processo: dict[str, list[int]],
+    indices_vazados: Optional[np.ndarray] = None,
 ) -> None:
+    """
+    indices_por_processo: chunks que nao podem ser negativos de cada processo
+    (os dele e os dos processos quase duplicados).
+    indices_vazados: chunks com a ementa copiada, fora de todas as consultas. No teste esses
+    chunks nao existem; como negativos, ensinariam o modelo a afastar "texto com cara de ementa".
+    """
     # O indice global vira indice local da fatia. Chunk de outro processo, ou de outra placa, fica de fora.
     for i_local, proc in enumerate(batch_procs):
         locais = [
@@ -342,6 +351,10 @@ def _mascarar_mesmo_processo(
         ]
         if locais:
             sims[i_local, locais] = -1e9
+    if indices_vazados is not None and len(indices_vazados):
+        na_fatia = indices_vazados[(indices_vazados >= offset) & (indices_vazados < offset + n_local)] - offset
+        if len(na_fatia):
+            sims[:, torch.as_tensor(na_fatia, device=sims.device, dtype=torch.long)] = -1e9
 
 
 def _topk_numa_fatia(
@@ -352,11 +365,12 @@ def _topk_numa_fatia(
     indices_por_processo: dict[str, list[int]],
     k: int,
     dtype_tensor: torch.dtype,
+    indices_vazados: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     # As ementas nascem numa placa so. A copia para a fatia e pequena: 256 vetores.
     q_local = q_embs.to(device=matriz.device, dtype=dtype_tensor)
     sims = torch.matmul(q_local, matriz.T)
-    _mascarar_mesmo_processo(sims, offset, matriz.shape[0], batch_procs, indices_por_processo)
+    _mascarar_mesmo_processo(sims, offset, matriz.shape[0], batch_procs, indices_por_processo, indices_vazados)
     k_local = min(k, matriz.shape[0])
     scores, indices = torch.topk(sims, k=k_local, dim=-1)
     # Soma o deslocamento da fatia para o indice voltar a ser o da matriz completa.
@@ -694,6 +708,7 @@ def minerar_tripletos_contrastivos(
     recomputar_embeddings: bool = False,
     dispositivos: list[str] | None = None,
     retomar: bool = True,
+    excluir_vazados_como_negativos: bool = True,
 ) -> dict[str, Any]:
     """
     Executa a mineracao em lote de tripletos.
@@ -705,12 +720,18 @@ def minerar_tripletos_contrastivos(
     - Avaliacao Focada: O calculo da similaridade de cosseno contra o texto positivo (ancora) e restrito ao subconjunto Top-K.
     - Vetores do ranking: candidatos e positivos saem da matriz na GPU, sem reler o .npy.
     - Retomada: o JSONL e aberto em append. O sidecar guarda o ultimo processo completo.
+
+    Protecoes contra vazamento e falsos negativos:
+    - Chunks do proprio processo e dos processos do mesmo grupo de quase duplicatas nunca sao negativos.
+    - Chunks com a ementa copiada (contem_vazamento_ementa) nao sao negativos de ninguem
+      (excluir_vazados_como_negativos) e nunca sao positivos (ignorar_chunk_0_como_positivo).
+      Processo sem chunk limpo nao gera tuplas.
     """
     saida = Path(arquivo_saida)
     saida.parent.mkdir(parents=True, exist_ok=True)
 
     device = modelo.device
-    dtype_tensor = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else (torch.float16 if device.type == "cuda" else torch.float32)
+    dtype_tensor = dtype_para_dispositivo(device)
 
     # 1. Indexacao rapida de processos
     indices_por_processo: dict[str, list[int]] = defaultdict(list)
@@ -721,8 +742,29 @@ def minerar_tripletos_contrastivos(
     textos_corpus = [ch.texto for ch in chunks_corpus]
     total_chunks = len(chunks_corpus)
 
+    # Mascara de negativos: chunks do grupo de quase duplicatas inteiro, nao so do processo.
+    indices_por_grupo: dict[str, list[int]] = defaultdict(list)
+    for proc in processos_validos:
+        indices_por_grupo[proc.grupo_duplicata].extend(indices_por_processo[proc.id_global])
+    mascara_por_processo: dict[str, list[int]] = {
+        proc.id_global: indices_por_grupo[proc.grupo_duplicata] for proc in processos_validos
+    }
+    processos_com_gemeos = sum(
+        1 for proc in processos_validos
+        if len(mascara_por_processo[proc.id_global]) > len(indices_por_processo[proc.id_global])
+    )
+
+    indices_vazados = (
+        np.array([i for i, ch in enumerate(chunks_corpus) if ch.contem_vazamento_ementa], dtype=np.int64)
+        if excluir_vazados_como_negativos
+        else None
+    )
+
     print(f"Total de chunks a vetorizar: {total_chunks:,}")
     print(f"Total de processos para consulta: {len(processos_validos):,}")
+    print(f"Processos com quase duplicatas mascaradas: {processos_com_gemeos:,}")
+    if indices_vazados is not None:
+        print(f"Chunks com vazamento fora dos negativos : {len(indices_vazados):,}")
 
     # 2. Vetorizacao do corpus, ou reuso do .npy float16 ja gravado
     caminho_embeddings = Path(arquivo_embeddings) if arquivo_embeddings else (saida.parent / NOME_ARQUIVO_EMBEDDINGS)
@@ -754,6 +796,9 @@ def minerar_tripletos_contrastivos(
         "tripletos_novos": 0,
         "chunks_positivos_avaliados": 0,
         "chunks_sem_negativos_suficientes": 0,
+        "chunks_vazados_ignorados_como_positivo": 0,
+        "processos_com_quase_duplicatas": processos_com_gemeos,
+        "chunks_vazados_fora_dos_negativos": int(len(indices_vazados)) if indices_vazados is not None else 0,
         "media_margem_tripletos": 0.0,
     }
 
@@ -810,9 +855,10 @@ def minerar_tripletos_contrastivos(
                                 matriz=matriz,
                                 offset=offset,
                                 batch_procs=batch_procs,
-                                indices_por_processo=indices_por_processo,
+                                indices_por_processo=mascara_por_processo,
                                 k=k_candidatos_gpu,
                                 dtype_tensor=dtype_tensor,
+                                indices_vazados=indices_vazados,
                             )
                             partes_scores.append(scores_fatia)
                             partes_indices.append(indices_fatia)
@@ -823,10 +869,10 @@ def minerar_tripletos_contrastivos(
                         # Multiplicacao de matrizes em lote na GPU
                         sims_batch_gpu = torch.matmul(q_embs_gpu, corpus_embs_gpu.T)
 
-                        # Mascara chunks do mesmo processo judicial diretamente na GPU
-                        for i_local, proc in enumerate(batch_procs):
-                            pos_idx_list = indices_por_processo[proc.id_global]
-                            sims_batch_gpu[i_local, pos_idx_list] = -1e9
+                        # Mascara o processo, seus quase duplicados e os chunks vazados, direto na GPU
+                        _mascarar_mesmo_processo(
+                            sims_batch_gpu, 0, total_chunks, batch_procs, mascara_por_processo, indices_vazados
+                        )
 
                         # Top-K direto na GPU: extrai apenas os candidatos mais proximos
                         top_scores_gpu, top_indices_gpu = torch.topk(sims_batch_gpu, k=k_candidatos_gpu, dim=-1)
@@ -873,12 +919,10 @@ def minerar_tripletos_contrastivos(
                     for j_pos, pos_idx in enumerate(pos_indices):
                         ch_positivo = chunks_corpus[pos_idx]
 
-                        # Filtro do Chunk 0: evita usar cabeçalho se houver outros chunks limpos
-                        if (
-                            ignorar_chunk_0_como_positivo
-                            and ch_positivo.contem_vazamento_ementa
-                            and len(pos_indices) > 1
-                        ):
+                        # Chunk com a ementa copiada nunca e positivo, mesmo sendo o unico do processo:
+                        # treinaria o atalho lexical que a avaliacao remove.
+                        if ignorar_chunk_0_como_positivo and ch_positivo.contem_vazamento_ementa:
+                            stats["chunks_vazados_ignorados_como_positivo"] += 1
                             continue
 
                         stats["chunks_positivos_avaliados"] += 1

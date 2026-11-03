@@ -28,6 +28,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 from src.data.cleaner import carregar_e_filtrar_processos
+from src.data.dedup import agrupar_quase_duplicatas
 from src.data.splitter import dividir_treino_val_teste, salvar_splits_processos
 
 
@@ -204,6 +205,22 @@ def main() -> None:
     if not processos_validos:
         raise ValueError("Nenhum processo valido restou apos a aplicacao dos filtros de qualidade.")
 
+    # 1b. Grupos de ementas quase identicas: cada grupo fica inteiro num split
+    cfg_dup = cfg_data.get("quase_duplicatas", {}) or {}
+    stats_dup: dict = {}
+    if cfg_dup.get("ativo", True):
+        print("-" * 64)
+        print("Agrupando ementas quase identicas (MinHash + Jaccard)...")
+        stats_dup = agrupar_quase_duplicatas(
+            processos_validos,
+            limiar_jaccard=float(cfg_dup.get("limiar_jaccard", 0.80)),
+            ngram=int(cfg_dup.get("ngram", 5)),
+            seed=seed,
+        )
+        print(f"Grupos                : {stats_dup['grupos']:,} (de {stats_dup['processos']:,} processos)")
+        print(f"Grupos com 2+ membros : {stats_dup['grupos_multiplos']:,} ({stats_dup['processos_em_grupos_multiplos']:,} processos)")
+        print(f"Maior grupo           : {stats_dup['maior_grupo']:,} processos")
+
     # 2. Divisão em Treino, Validação e Teste (Stratified Group Split)
     print("-" * 64)
     print("Executando divisao estratificada por tribunal e agrupada por processo...")
@@ -246,7 +263,22 @@ def main() -> None:
         f.write("Descartes por Motivo:\n")
         for k, v in stats_filtro["motivos_descarte"].items():
             f.write(f"  - {k}: {v:,}\n")
-        f.write("\nParticionamento:\n")
+        if stats_dup:
+            f.write("\nQuase duplicatas (ementas com Jaccard >= "
+                    f"{stats_dup['limiar_jaccard']}, blocos de {stats_dup['ngram']} palavras):\n")
+            f.write(f"  - Grupos                : {stats_dup['grupos']:,}\n")
+            f.write(f"  - Grupos com 2+ membros : {stats_dup['grupos_multiplos']:,}\n")
+            f.write(f"  - Processos nesses grupos: {stats_dup['processos_em_grupos_multiplos']:,}\n")
+            f.write(f"  - Maior grupo           : {stats_dup['maior_grupo']:,}\n")
+            f.write(f"  - Pares confirmados     : {stats_dup['pares_confirmados']:,} "
+                    f"(de {stats_dup['pares_candidatos']:,} candidatos)\n")
+            f.write("  - Tamanho do grupo -> quantidade de grupos:\n")
+            for tamanho, qtd in stats_dup["distribuicao_tamanho_grupo"].items():
+                f.write(f"      {tamanho}: {qtd:,}\n")
+            f.write("  - Jaccard dos pares candidatos (para calibrar o limiar):\n")
+            for faixa, qtd in stats_dup["histograma_jaccard_candidatos"].items():
+                f.write(f"      {faixa}: {qtd:,}\n")
+        f.write("\nParticionamento (grupos inteiros em cada conjunto):\n")
         f.write(f"  - Treino    : {len(treino):,} processos\n")
         f.write(f"  - Validacao : {len(validacao):,} processos\n")
         f.write(f"  - Teste     : {len(teste):,} processos\n\n")

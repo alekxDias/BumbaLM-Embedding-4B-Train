@@ -1,0 +1,12 @@
+# Dependencias do pipeline (o torch e instalado antes, pelo indice do PyTorch: ver cluster/criar_ambiente.sh)
+sentence-transformers>=5.0,<6
+transformers>=4.51,<5
+peft>=0.15
+accelerate>=1.0
+datasets>=3.0
+pyarrow
+numpy
+pyyaml
+psutil
+tqdm
+huggingface_hub

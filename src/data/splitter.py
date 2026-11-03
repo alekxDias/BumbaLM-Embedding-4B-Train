@@ -22,10 +22,12 @@ def dividir_treino_val_teste(
 ) -> tuple[list[ProcessoJudicial], list[ProcessoJudicial], list[ProcessoJudicial], dict[str, Any]]:
     """
     Divide a lista de processos em Treino, Validacao e Teste com garantia de:
-    1. Zero vazamento de dados: O particionamento e feito a nivel de processo judicial
-       (id_global unico). Nenhum processo estara em mais de uma particao.
+    1. Zero vazamento de dados: O particionamento e feito por grupo de quase duplicatas
+       (grupo_duplicata, ver src/data/dedup.py). Sem agrupamento, o grupo e o proprio processo.
+       Nenhum processo, nem um "gemeo" dele, estara em mais de uma particao.
     2. Estratificacao por tribunal: A distribuicao percentual (ex.: 80/10/10) e aplicada
-       proporcionalmente dentro de cada tribunal existente na base.
+       proporcionalmente dentro de cada tribunal existente na base. Com grupos inteiros,
+       as proporcoes ficam aproximadas.
 
     Args:
         processos: Lista de objetos ProcessoJudicial ja validados e deduplicados.
@@ -56,11 +58,14 @@ def dividir_treino_val_teste(
     teste: list[ProcessoJudicial] = []
 
     for tribunal, lista_procs in sorted(por_tribunal.items()):
-        # Embaralhamento deterministico por tribunal
-        procs_embaralhados = list(lista_procs)
-        rng.shuffle(procs_embaralhados)
+        # Grupos de quase duplicatas, em ordem estavel antes do embaralhamento deterministico
+        por_grupo: dict[str, list[ProcessoJudicial]] = defaultdict(list)
+        for proc in lista_procs:
+            por_grupo[proc.grupo_duplicata].append(proc)
+        grupos = [por_grupo[g] for g in sorted(por_grupo)]
+        rng.shuffle(grupos)
 
-        n = len(procs_embaralhados)
+        n = len(lista_procs)
         n_train = int(n * train_ratio)
         n_val = int(n * val_ratio)
 
@@ -68,13 +73,16 @@ def dividir_treino_val_teste(
         if n_train == 0 and n > 0:
             n_train = 1
 
-        t_split = procs_embaralhados[:n_train]
-        v_split = procs_embaralhados[n_train : n_train + n_val]
-        te_split = procs_embaralhados[n_train + n_val :]
-
-        treino.extend(t_split)
-        validacao.extend(v_split)
-        teste.extend(te_split)
+        # Grupo inteiro vai para o split que ainda nao atingiu a cota de processos
+        acumulado = 0
+        for grupo in grupos:
+            if acumulado < n_train:
+                treino.extend(grupo)
+            elif acumulado < n_train + n_val:
+                validacao.extend(grupo)
+            else:
+                teste.extend(grupo)
+            acumulado += len(grupo)
 
     # Verificacao formal de blindagem contra vazamento de dados
     ids_treino = {p.id_global for p in treino}
@@ -90,6 +98,13 @@ def dividir_treino_val_teste(
             f"Falha de integridade: Vazamento detectado entre conjuntos! "
             f"Treino x Val: {len(inter_train_val)} | Treino x Teste: {len(inter_train_test)} | Val x Teste: {len(inter_val_test)}"
         )
+
+    # O mesmo vale para os grupos de quase duplicatas
+    grupos_treino = {p.grupo_duplicata for p in treino}
+    grupos_val = {p.grupo_duplicata for p in validacao}
+    grupos_teste = {p.grupo_duplicata for p in teste}
+    if (grupos_treino & grupos_val) or (grupos_treino & grupos_teste) or (grupos_val & grupos_teste):
+        raise RuntimeError("Falha de integridade: um grupo de quase duplicatas ficou dividido entre conjuntos.")
 
     estatisticas = {
         "total_processos": len(processos),
@@ -109,6 +124,11 @@ def dividir_treino_val_teste(
             "por_tribunal": dict(Counter(p.tribunal for p in teste)),
         },
         "vazamento_detectado": False,
+        "grupos_por_conjunto": {
+            "treino": len(grupos_treino),
+            "validacao": len(grupos_val),
+            "teste": len(grupos_teste),
+        },
     }
 
     return treino, validacao, teste, estatisticas

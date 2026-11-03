@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N bumbalm_treino
+#PBS -q accel
+#PBS -l nodes=1:ppn=15
+# Tempo maximo do job. Descomente e ajuste quando souber o limite da fila accel:
+##PBS -l walltime=72:00:00
+# Saida e erro juntos. Caminho relativo a pasta de onde voce rodou o qsub (raiz do projeto).
+#PBS -j oe
+#PBS -o logs/bumbalm_treino.pbs.log
+
+cd "$PBS_O_WORKDIR"
+source cluster/env.sh
+set -eo pipefail
+
+LOG="logs/bumbalm_treino_${PBS_JOBID%%.*}.log"
+echo "Job $PBS_JOBID em $(hostname) | $(date)" | tee "$LOG"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | tee -a "$LOG"
+python -c "import torch; print('PyTorch', torch.__version__, '| GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NENHUMA')" | tee -a "$LOG"
+
+# Etapa 4: uma variante por job. Escolha com -v:
+#   qsub -v NEGATIVOS=dificeis cluster/pbs/03_treinar.pbs
+#   qsub -v NEGATIVOS=nenhum,LIMITE_TUPLAS=50000 cluster/pbs/03_treinar.pbs
+# Se o job cair por tempo, submeta de novo com os mesmos valores: ele retoma do ultimo checkpoint.
+NEGATIVOS="${NEGATIVOS:-dificeis}"
+EXPERIMENTO="${EXPERIMENTO:-tcc_tjma_ablacao_negativos}"
+case "$NEGATIVOS" in
+    dificeis|aleatorios|nenhum) ;;
+    *) echo "NEGATIVOS invalido: '$NEGATIVOS' (use dificeis, aleatorios ou nenhum)" | tee -a "$LOG"; exit 1 ;;
+esac
+
+ARGS=(--negativos "$NEGATIVOS")
+if [ -n "$LIMITE_TUPLAS" ]; then
+    ARGS+=(--limite_tuplas "$LIMITE_TUPLAS")
+fi
+# Retomar so quando ja existe checkpoint: com a pasta vazia o Trainer aborta.
+if ls -d "experiments/$EXPERIMENTO/$NEGATIVOS"/checkpoint-* >/dev/null 2>&1; then
+    echo "Checkpoint encontrado: retomando." | tee -a "$LOG"
+    ARGS+=(--resume_from_checkpoint auto)
+fi
+
+echo "Variante: $NEGATIVOS | Limite de tuplas: ${LIMITE_TUPLAS:-todas}" | tee -a "$LOG"
+python -u scripts/04_train.py "${ARGS[@]}" 2>&1 | tee -a "$LOG"

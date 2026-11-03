@@ -41,11 +41,17 @@ def carregar_dataset_tripletos(
     caminho_arquivo: Path | str,
     n_negativos: int = 5,
     query_instruction: str = "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: ",
+    limite_tuplas: Optional[int] = None,
+    seed: int = 42,
 ) -> Dataset:
     """
     Le o arquivo de tripletos minerados e monta o Dataset HuggingFace estruturado
     nas colunas exigidas pela CachedMultipleNegativesRankingLoss:
     ['anchor', 'positive', 'negative_0', ..., 'negative_4']
+
+    Com n_negativos=0 restam ['anchor', 'positive']: a loss usa so os negativos do proprio lote.
+    limite_tuplas sorteia um subconjunto com a semente. Os arquivos de hard negatives e de
+    negativos aleatorios tem as mesmas linhas na mesma ordem, entao o sorteio pega os mesmos pares.
     """
     caminho = Path(caminho_arquivo)
     if not caminho.is_file():
@@ -93,6 +99,10 @@ def carregar_dataset_tripletos(
     dataset = Dataset(tabela_arrow)
 
     _imprimir(f"Dataset de Treino Carregado: {validos:,} tripletos validos (descartados: {descartados:,})")
+    if limite_tuplas and len(dataset) > limite_tuplas:
+        dataset = dataset.shuffle(seed=seed).select(range(int(limite_tuplas)))
+        _imprimir(f"  - Subconjunto sorteado    : {len(dataset):,} tuplas (semente {seed})")
+    _imprimir(f"  - Colunas                 : {dataset.column_names}")
     return dataset
 
 
@@ -109,17 +119,23 @@ def configurar_treinador(
     warmup_ratio: float = 0.05,
     eval_steps: int = 250,
     save_steps: int = 250,
-    bf16: bool = True,
+    precisao_mista: str = "bf16",
     dataloader_num_workers: int = 4,
     dataloader_pin_memory: bool = False,
     scale: float = 50.0,
     evaluator: Optional[Any] = None,
     metric_for_best_model: str = "val_cosine_ndcg@10",
     greater_is_better: bool = True,
+    save_total_limit: int = 2,
+    carregar_melhor_no_fim: bool = True,
+    seed: int = 42,
 ) -> tuple[SentenceTransformerTrainer, ScientificMetricsCallback]:
     """
-    Instancia a CachedMultipleNegativesRankingLoss e configura o SentenceTransformerTrainer
-    com argumentos de alto desempenho otimizados para GPU H200 (141 GB).
+    Instancia a CachedMultipleNegativesRankingLoss e configura o SentenceTransformerTrainer.
+
+    precisao_mista: "bf16" (A100/H200), "fp16" (V100) ou "no".
+    carregar_melhor_no_fim: com LoRA fica False. O melhor checkpoint e lido depois pelo caminho
+    gravado em trainer.state.best_model_checkpoint.
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -168,7 +184,7 @@ def configurar_treinador(
     _imprimir(f"  - Negativos entre GPUs     : {juntar_gpus}")
     _imprimir(f"  - Total Steps Estimados    : {total_steps:,} | Warmup: {warmup_steps:,}")
     _imprimir(f"  - Taxa de Aprendizado (LR) : {learning_rate}")
-    _imprimir(f"  - Precisao bfloat16        : {bf16}")
+    _imprimir(f"  - Precisao mista           : {precisao_mista}")
     _imprimir(f"  - Dataloader Workers       : {dataloader_num_workers} | Pin Memory: {dataloader_pin_memory}")
     if tem_avaliador:
         _imprimir(f"  - Avaliador de Validacao   : Ativado (a cada {eval_steps_efetivo} steps)")
@@ -186,14 +202,14 @@ def configurar_treinador(
         weight_decay=weight_decay,
         warmup_steps=warmup_steps,
         lr_scheduler_type="cosine",
-        bf16=bf16 and torch.cuda.is_available(),
-        fp16=False,
+        bf16=precisao_mista == "bf16" and torch.cuda.is_available(),
+        fp16=precisao_mista == "fp16" and torch.cuda.is_available(),
         eval_strategy="steps" if tem_avaliador else "no",
         eval_steps=eval_steps_efetivo if tem_avaliador else None,
         save_strategy="steps",
         save_steps=save_steps_efetivo,
-        save_total_limit=2,
-        load_best_model_at_end=tem_avaliador,
+        save_total_limit=save_total_limit,
+        load_best_model_at_end=tem_avaliador and carregar_melhor_no_fim,
         metric_for_best_model=metric_for_best_model if tem_avaliador else None,
         greater_is_better=greater_is_better if tem_avaliador else None,
         logging_steps=10,
@@ -202,6 +218,7 @@ def configurar_treinador(
         dataloader_pin_memory=dataloader_pin_memory,
         remove_unused_columns=False,
         batch_sampler=BatchSamplers.NO_DUPLICATES,
+        seed=seed,
     )
 
     # 4. Callback de Telemetria Cientifica

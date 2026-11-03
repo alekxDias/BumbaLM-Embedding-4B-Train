@@ -101,6 +101,7 @@ def processar_split(
     chunk_size: int,
     overlap: int,
     trecho_minimo_auditoria: int,
+    cfg_cobertura: dict | None = None,
 ) -> tuple[list[ChunkProcesso], dict]:
     """
     Executa chunking e auditoria de vazamento para uma determinada particao.
@@ -123,6 +124,7 @@ def processar_split(
             processo=proc,
             chunks=chunks_proc,
             trecho_minimo=trecho_minimo_auditoria,
+            **(cfg_cobertura or {}),
         )
         chunks_split.extend(chunks_auditados)
 
@@ -146,6 +148,11 @@ def main() -> None:
     chunk_size = chunk_cfg.get("chunk_size_tokens", 768)
     overlap = chunk_cfg.get("chunk_overlap_tokens", 128)
     trecho_minimo = chunk_cfg.get("min_caracteres_contaminacao", 200)
+    cfg_cobertura = {
+        "limiar_cobertura": chunk_cfg.get("limiar_cobertura_ementa", 0.30),
+        "min_palavras_cobertura": int(chunk_cfg.get("min_palavras_cobertura", 12)),
+        "ngram_cobertura": int(chunk_cfg.get("ngram_cobertura", 6)),
+    }
 
     print("=" * 64)
     print("BumbaLM - Etapa 2: Chunking por Tokens e Auditoria de Ementa")
@@ -154,6 +161,10 @@ def main() -> None:
     print(f"Modelo Tokenizador  : {model_id_tokenizer}")
     print(f"Tamanho do Chunk    : {chunk_size} tokens | Overlap: {overlap} tokens")
     print(f"Trecho Minimo Audit : {trecho_minimo} caracteres normalizados")
+    print(
+        f"Cobertura da Ementa : >= {cfg_cobertura['limiar_cobertura']} e >= {cfg_cobertura['min_palavras_cobertura']} palavras "
+        f"(blocos de {cfg_cobertura['ngram_cobertura']})"
+    )
     print("-" * 64)
 
     # 1. Carregamento do tokenizador
@@ -184,6 +195,7 @@ def main() -> None:
             chunk_size=chunk_size,
             overlap=overlap,
             trecho_minimo_auditoria=trecho_minimo,
+            cfg_cobertura=cfg_cobertura,
         )
 
         caminho_saida_chunks = dir_processados / f"{nome}_corpus_chunks.jsonl"
@@ -196,7 +208,8 @@ def main() -> None:
         print(f"  - Total de chunks     : {relatorio['total_chunks']:,}")
         print(f"  - Chunks limpos       : {relatorio['limpos']:,} ({(1 - relatorio['taxa_contaminacao']):.1%})")
         print(f"  - Chunks contaminados : {relatorio['contaminados']:,} ({relatorio['taxa_contaminacao']:.1%})")
-        print(f"    (Chunks com ementa identificados principalmente no Chunk 0)")
+        print(f"  - Motivos             : {relatorio['motivos']}")
+        print(f"  - Processos sem chunk limpo (saem da avaliacao): {relatorio['processos_sem_chunk_limpo']:,}")
 
     # 3. Emissao do relatorio de auditoria consolidado
     relatorio_txt = dir_processados / "relatorio_auditoria_chunks.txt"
@@ -205,7 +218,11 @@ def main() -> None:
         f.write("RELATORIO DE AUDITORIA DE CHUNKING E VAZAMENTO DE EMENTA\n")
         f.write("=" * 64 + "\n\n")
         f.write(f"Configuracao: chunk_size={chunk_size} tokens | overlap={overlap} tokens\n")
-        f.write(f"Tokenizador : {model_id_tokenizer}\n\n")
+        f.write(f"Tokenizador : {model_id_tokenizer}\n")
+        f.write(
+            f"Vazamento   : janela de {trecho_minimo} caracteres ou cobertura >= {cfg_cobertura['limiar_cobertura']} "
+            f"(min. {cfg_cobertura['min_palavras_cobertura']} palavras, blocos de {cfg_cobertura['ngram_cobertura']})\n\n"
+        )
 
         for split_nome, rel in relatorios_splits.items():
             f.write(f"--- SPLIT: {split_nome.upper()} ---\n")
@@ -218,6 +235,13 @@ def main() -> None:
             f.write("Contaminacao por Posicao do Chunk:\n")
             for ch_idx, qtd in rel["distribuicao_por_indice_chunk"].items():
                 f.write(f"  - {ch_idx}: {qtd:,}\n")
+            f.write(
+                f"Processos sem chunk limpo: {rel['processos_sem_chunk_limpo']:,} de {rel['total_processos']:,} "
+                "(ficam fora da avaliacao e nao geram tuplas)\n"
+            )
+            f.write("Histograma da cobertura da ementa por chunk (todos os chunks):\n")
+            for faixa, qtd in rel["histograma_cobertura"].items():
+                f.write(f"  - {faixa}: {qtd:,}\n")
             f.write("\n")
 
     arquivos_gerados.append(relatorio_txt)
