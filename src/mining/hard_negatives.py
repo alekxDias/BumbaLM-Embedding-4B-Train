@@ -31,6 +31,11 @@ DEFAULT_QUERY_INSTRUCTION = (
 
 NOME_ARQUIVO_EMBEDDINGS = "corpus_embeddings_f16.npy"
 _BLOCO_GRAVACAO_EMBEDDINGS = 100_000
+# Valor das similaridades mascaradas. Cabe em float16 (maximo 65504): -1e9 so funcionava em
+# bfloat16 e quebrava na V100 ("value cannot be converted to type at::Half without overflow").
+# Cosseno nunca passa de -1, entao qualquer score abaixo de -2 e mascarado.
+_VALOR_MASCARA = -1e4
+_LIMITE_MASCARADO = -2.0
 # Le so o id_global na retomada, sem montar o JSON inteiro da linha.
 _RE_ID_GLOBAL = re.compile(rb'"id_global"\s*:\s*"([^"\\]+)"')
 
@@ -428,11 +433,11 @@ def _mascarar_mesmo_processo(
             if offset <= idx < offset + n_local
         ]
         if locais:
-            sims[i_local, locais] = -1e9
+            sims[i_local, locais] = _VALOR_MASCARA
     if indices_vazados is not None and len(indices_vazados):
         na_fatia = indices_vazados[(indices_vazados >= offset) & (indices_vazados < offset + n_local)] - offset
         if len(na_fatia):
-            sims[:, torch.as_tensor(na_fatia, device=sims.device, dtype=torch.long)] = -1e9
+            sims[:, torch.as_tensor(na_fatia, device=sims.device, dtype=torch.long)] = _VALOR_MASCARA
 
 
 def _topk_numa_fatia(
@@ -467,7 +472,7 @@ def _juntar_topk(
     scores = np.concatenate(partes_scores, axis=1)
     indices = np.concatenate(partes_indices, axis=1)
     k_final = min(k, scores.shape[1])
-    # O sinal negativo coloca os mais similares primeiro. -1e9, o mascarado, vai para o fim.
+    # O sinal negativo coloca os mais similares primeiro. O mascarado (_VALOR_MASCARA) vai para o fim.
     ordem = np.argsort(-scores, axis=1)[:, :k_final]
     return np.take_along_axis(scores, ordem, axis=1), np.take_along_axis(indices, ordem, axis=1)
 
@@ -990,7 +995,7 @@ def minerar_tripletos_contrastivos(
                     ).float()
                     scores_pos_vec = torch.matmul(pos_embs_f32, q_embs_gpu[i_local].float()).cpu().numpy()
                     limpos = [s for s, i in zip(scores_pos_vec, pos_indices) if not chunks_corpus[i].contem_vazamento_ementa]
-                    validos_q = cands_score_q[cands_score_q > -1e8]
+                    validos_q = cands_score_q[cands_score_q > _LIMITE_MASCARADO]
                     if len(validos_q):
                         amostras_scores["melhor_candidato"].append(float(validos_q[0]))
                         amostras_scores["candidato_50"].append(float(validos_q[min(49, len(validos_q) - 1)]))
