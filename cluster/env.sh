@@ -1,13 +1,9 @@
 #!/bin/bash
 # Ambiente comum a todos os jobs. Os .pbs fazem: source cluster/env.sh
-# Ajuste os tres caminhos abaixo se mudar a pasta do projeto ou o nome do ambiente.
+# Os caminhos ficam em cluster/caminhos.sh.
 
-CONDA_BASE="/home/fabio.lobato/miniconda3"
-AMBIENTE="bumbalm"
-export HF_HOME="/projetos/ctcca/nlp/hf_cache"
-
-source "$CONDA_BASE/etc/profile.d/conda.sh"
-conda activate "$AMBIENTE"
+source "$(dirname "${BASH_SOURCE[0]}")/caminhos.sh"
+conda activate "$AMBIENTE_DIR"
 
 # Igual ao exemplo do orientador
 module load cuda 2>/dev/null || true

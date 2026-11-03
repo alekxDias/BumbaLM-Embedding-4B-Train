@@ -1,5 +1,5 @@
 #!/bin/bash
-# Baixa o Qwen3-Embedding-4B para o cache compartilhado (~8 GB). Rode uma vez, no no de login:
+# Baixa o Qwen3-Embedding-4B para o cache em /projetos (~8 GB). Rode uma vez, no no de login:
 #   bash cluster/baixar_modelo.sh
 set -e
 source cluster/env.sh

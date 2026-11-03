@@ -50,13 +50,16 @@ cd /projetos/ctcca/nlp
 git clone -b tcc/ablacao-negativos-tjma https://github.com/alekxDias/BumbaLM-Embedding-4B-Train.git
 cd BumbaLM-Embedding-4B-Train
 
-bash cluster/criar_ambiente.sh   # cria o conda "bumbalm" (python 3.11, torch 2.7.1+cu118, peft...)
+bash cluster/criar_ambiente.sh   # cria o conda em /projetos/ctcca/nlp/conda_envs/bumbalm (python 3.11, torch 2.7.1+cu118, peft...)
 bash cluster/baixar_modelo.sh    # baixa o Qwen3-Embedding-4B (~8 GB) para /projetos/ctcca/nlp/hf_cache
 ```
 
 - Os pares são lidos de `/projetos/ctcca/nlp/dados_tjma/pares_tjma.jsonl` (`configs/config_base.yaml`).
 - Os jobs rodam **offline** (`HF_HUB_OFFLINE=1` em `cluster/env.sh`), porque nós de computação costumam não ter internet. Por isso o modelo é baixado antes.
-- Caminhos do conda, do ambiente e do cache ficam em `cluster/env.sh`.
+- **O `/home` tem cota pequena.** Por isso o ambiente conda, os caches do pip e do conda e o modelo ficam em `/projetos/ctcca/nlp`. Todos esses caminhos estão em `cluster/caminhos.sh`.
+- O pip da conta aponta para `pypi.ngc.nvidia.com`, inacessível daqui. O script usa `pip --isolated` para ignorar essa configuração.
+
+Se aparecer `Cota da disco excedida`, veja o uso com `quota -s` e `du -sh ~/.cache ~/miniconda3/pkgs ~/miniconda3/envs/*`.
 
 ---
 
