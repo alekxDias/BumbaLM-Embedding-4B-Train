@@ -288,8 +288,8 @@ def main() -> None:
             cmd.extend(["--split", args.eval_split])
             if args.compare_baseline:
                 cmd.append("--compare_baseline")
-            if args.batch_size:
-                cmd.extend(["--batch_size", str(args.batch_size)])
+            # --batch_size aqui e o lote de TREINO; a avaliacao usa avaliacao.eval_batch_size do YAML.
+            # Repassar 64 ou 96 para a inferencia estourava a memoria da V100.
 
         sucesso = executar_comando(cmd, f"{etapa}:{variante}" if variante else etapa)
         if not sucesso:

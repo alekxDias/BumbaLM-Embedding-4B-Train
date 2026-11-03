@@ -51,8 +51,9 @@ mineracao_negativos:
   top_k_candidatos: 200
   
   # Lotes de mineracao acelerada em GPU
-  # 64 cabe na V100 de 32 GB com textos de 768 tokens. Na H200 da para subir a 256.
-  encode_batch_size: 64
+  # 32 na V100 de 32 GB: no TJRS quase todo chunk tem os 768 tokens, e 64 estourou a memoria
+  # (sem kernel de atencao otimizado, a V100 materializa a matriz de atencao). Na H200 da para 256.
+  encode_batch_size: 32
   query_batch_size: 256
   # Vetorizacao do corpus em blocos retomaveis (~35 min cada na V100). Se o job cair, recomeca do bloco seguinte.
   bloco_vetorizacao: 20000

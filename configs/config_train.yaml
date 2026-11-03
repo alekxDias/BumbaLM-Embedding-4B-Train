@@ -67,9 +67,9 @@ loss:
 avaliacao:
   eval_batch_size: 32
   # Validacao durante o treino com amostra fixa de processos (mesma nas tres variantes).
-  # O corpus inteiro de validacao levaria ~1 h por avaliacao na V100.
+  # No TJRS sao ~11 chunks por processo: 300 processos = ~3.400 chunks = ~13 min por avaliacao na V100.
   # A Etapa 5 sempre usa o split de teste completo.
-  max_processos_val: 1000
+  max_processos_val: 300
   # Precisao dos pesos na Etapa 5. "fp32" se aparecer NaN em fp16.
   precisao: "auto"
   metricas:

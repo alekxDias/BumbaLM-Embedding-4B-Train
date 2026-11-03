@@ -110,7 +110,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data_dir", type=Path, default=None, help="Diretorio com os dados processados.")
     parser.add_argument("--output_dir", type=Path, default=None, help="Diretorio dos relatorios de avaliacao.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size da inferencia.")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Batch size da inferencia. Padrao: avaliacao.eval_batch_size do config_train.yaml (32 na V100).",
+    )
     parser.add_argument(
         "--precisao",
         type=str,
@@ -249,6 +254,8 @@ def main() -> None:
     )
     max_seq_length = int(modelo_cfg.get("max_seq_length", 768))
     precisao = args.precisao or str(cfg_train.get("avaliacao", {}).get("precisao", "auto"))
+    if args.batch_size is None:
+        args.batch_size = int(cfg_train.get("avaliacao", {}).get("eval_batch_size", 32))
     splits_para_avaliar = ["test"] if args.split == "test" else (["val"] if args.split == "val" else ["val", "test"])
 
     print("=" * 64)
