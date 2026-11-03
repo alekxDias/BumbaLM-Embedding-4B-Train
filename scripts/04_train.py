@@ -137,11 +137,27 @@ def _preparar_gpus(gpus: str) -> None:
     if len(ids) == 1:
         return
 
+    # Rendezvous fixo em 127.0.0.1. O --standalone anuncia o hostname do no, e no gpunode02
+    # ele resolve para um endereco inalcancavel (errno 101). Um no so: tudo pelo loopback.
+    import socket
+    endereco = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    porta = os.environ.get("MASTER_PORT")
+    if not porta:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind((endereco, 0))
+            porta = str(s.getsockname()[1])
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+
     comando = [
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--standalone",
+        "--nnodes", "1",
+        "--node_rank", "0",
+        "--rdzv_backend", "static",
+        "--master_addr", endereco,
+        "--master_port", porta,
         "--nproc_per_node",
         str(len(ids)),
         str(Path(__file__).resolve()),
