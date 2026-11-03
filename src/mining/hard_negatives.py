@@ -793,6 +793,7 @@ def minerar_tripletos_contrastivos(
     retomar: bool = True,
     excluir_vazados_como_negativos: bool = True,
     bloco_vetorizacao: int = 20_000,
+    max_relativo_positivo: float | None = 0.95,
 ) -> dict[str, Any]:
     """
     Executa a mineracao em lote de tripletos.
@@ -810,6 +811,11 @@ def minerar_tripletos_contrastivos(
     - Chunks com a ementa copiada (contem_vazamento_ementa) nao sao negativos de ninguem
       (excluir_vazados_como_negativos) e nunca sao positivos (ignorar_chunk_0_como_positivo).
       Processo sem chunk limpo nao gera tuplas.
+    - Filtro relativo ao positivo (NV-Retriever, Moreira et al., 2024): o negativo precisa ter
+      similaridade com a consulta menor que max_relativo_positivo x a do positivo da tupla.
+      O teto fixo de limiar_max deixa passar negativos acima de positivos fracos. None desliga.
+    - Os vetores das consultas sao gravados em <saida>_consultas/, para a Etapa 3b aplicar
+      o mesmo filtro aos negativos aleatorios.
     """
     saida = Path(arquivo_saida)
     saida.parent.mkdir(parents=True, exist_ok=True)
@@ -864,7 +870,30 @@ def minerar_tripletos_contrastivos(
         bloco_vetorizacao=bloco_vetorizacao,
     )
 
-    # 2b. Retomada: corta linha incompleta e devolve de qual processo seguir.
+    # 2b. Tuplas ja gravadas so valem se foram mineradas com as mesmas regras.
+    # Sem isso, mudar a faixa ou o teto relativo e rodar de novo reaproveitaria tuplas antigas.
+    parametros = {
+        "n_negativos": n_negativos,
+        "limiar_min": limiar_min,
+        "limiar_max": limiar_max,
+        "top_k": top_k,
+        "max_relativo_positivo": max_relativo_positivo,
+        "excluir_vazados_como_negativos": excluir_vazados_como_negativos,
+        "ignorar_chunk_0_como_positivo": ignorar_chunk_0_como_positivo,
+        "model_id": model_id,
+    }
+    arq_parametros = saida.with_suffix(".params.json")
+    if retomar and saida.is_file() and saida.stat().st_size > 0:
+        try:
+            anteriores = json.loads(arq_parametros.read_text(encoding="utf-8"))
+        except Exception:
+            anteriores = None
+        if anteriores != parametros:
+            print("Tuplas existentes foram mineradas com outras regras (ou sem registro delas). Recomecando a busca.")
+            retomar = False
+    arq_parametros.write_text(json.dumps(parametros, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Retomada: corta linha incompleta e devolve de qual processo seguir.
     progresso = _preparar_saida_tripletos(
         saida=saida,
         n_chunks_corpus=total_chunks,
@@ -886,6 +915,8 @@ def minerar_tripletos_contrastivos(
         "processos_com_quase_duplicatas": processos_com_gemeos,
         "chunks_vazados_fora_dos_negativos": int(len(indices_vazados)) if indices_vazados is not None else 0,
         "tuplas_com_negativo_acima_do_positivo": 0,
+        "tuplas_descartadas_filtro_relativo": 0,
+        "max_relativo_positivo": max_relativo_positivo,
         "media_margem_tripletos": 0.0,
     }
     amostras_scores: dict[str, list] = {
@@ -894,6 +925,12 @@ def minerar_tripletos_contrastivos(
         "melhor_positivo": [],
         "candidatos_na_faixa": [],
     }
+
+    # Vetores das consultas, um arquivo por lote (a retomada mantem os lotes ja feitos)
+    pasta_consultas = saida.with_name(saida.stem + "_consultas")
+    if inicio == 0 and pasta_consultas.is_dir():
+        shutil.rmtree(pasta_consultas)
+    pasta_consultas.mkdir(parents=True, exist_ok=True)
 
     if inicio >= len(processos_validos):
         print("Todos os processos ja estao no JSONL. Busca ignorada.")
@@ -937,6 +974,12 @@ def minerar_tripletos_contrastivos(
                         convert_to_tensor=True,
                         show_progress_bar=False,
                     ).to(dtype=dtype_tensor, device=device)
+
+                    # Grava antes do progresso: lote no sidecar sempre tem os vetores no disco
+                    np.save(pasta_consultas / f"lote_{start:08d}.npy", q_embs_gpu.float().cpu().numpy().astype(np.float16))
+                    (pasta_consultas / f"lote_{start:08d}.json").write_text(
+                        json.dumps([p.id_global for p in batch_procs]), encoding="utf-8"
+                    )
 
                     # Duas placas: top-k em cada metade e juncao. Uma placa: a matriz inteira, como antes.
                     if shards is not None:
@@ -1028,12 +1071,20 @@ def minerar_tripletos_contrastivos(
 
                         sims_p_array = sims_p_mat[j_pos]
 
-                        # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
-                        ordem = np.lexsort((cand_scores_q_array, sims_p_array))[::-1][:n_negativos]
-
-                        if len(ordem) < n_negativos:
+                        # Filtro relativo: o negativo fica abaixo de 95% da similaridade deste positivo
+                        if max_relativo_positivo is not None:
+                            teto = max_relativo_positivo * float(scores_pos_vec[j_pos])
+                            permitidos = np.nonzero(cand_scores_q_array < teto)[0]
+                        else:
+                            permitidos = np.arange(len(cand_scores_q_array))
+                        if len(permitidos) < n_negativos:
                             stats["chunks_sem_negativos_suficientes"] += 1
+                            stats["tuplas_descartadas_filtro_relativo"] += 1
                             continue
+
+                        # Ordenacao pelos negativos mais desafiadores (prioriza maior similaridade com o positivo)
+                        ordem_local = np.lexsort((cand_scores_q_array[permitidos], sims_p_array[permitidos]))[::-1]
+                        ordem = permitidos[ordem_local[:n_negativos]]
 
                         neg_indices_finais = cand_indices_array[ordem]
                         neg_scores_finais = [round(float(s), 4) for s in cand_scores_q_array[ordem]]
