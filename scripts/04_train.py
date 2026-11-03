@@ -479,6 +479,21 @@ def main() -> None:
             json.dumps(registro, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+        # Historico completo (loss e validacao por passo), que antes so existia dentro dos checkpoints
+        trainer.state.save_to_json(str(dir_saida / "trainer_state.json"))
+
+        # Checkpoint de fine-tuning completo tem ~24 GB (pesos + Adam). Terminada a variante,
+        # so o modelo escolhido importa; o resto seria peso morto no disco.
+        if train_cfg.get("apagar_checkpoints_ao_fim", False):
+            import shutil
+
+            manter = Path(registro["modelo_para_avaliar"]).resolve()
+            for ckpt in sorted(dir_saida.glob("checkpoint-*")):
+                if ckpt.resolve() == manter:
+                    continue
+                shutil.rmtree(ckpt, ignore_errors=True)
+                print(f"Checkpoint intermediario apagado: {ckpt}")
+
         print("=" * 64)
         print("Treinamento concluido com sucesso!")
         print(f"Modelo final persistido em : {best_model_path}")

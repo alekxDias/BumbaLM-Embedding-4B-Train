@@ -17,21 +17,17 @@ diff <(python -c "import yaml;print(yaml.safe_load(open('configs/config_train.ya
 ```
 
 ## Antes da primeira execução
-1. **Caminhos:** confira `cluster/h200/caminhos.sh` (conda, nome do ambiente, `HF_HOME`) e `diretorio_base_pares` em `configs/h200/config_base.yaml` e `configs/h200/config_base_smoke.yaml`.
-2. **Dados:** copie para essa pasta **o mesmo** `pares_tjrs_amostra60k_camaras.jsonl` gerado no tapajós. Com o mesmo arquivo e a mesma semente (42), o split é idêntico ao da V100.
-3. **Ambiente:** precisa de `peft`, `sentence-transformers>=5` e `transformers>=4.51,<5` (`requirements.txt`). Nas H200 prefira torch com CUDA 12.
+1. **Ambiente:** `cluster/h200/caminhos.sh` ativa o conda `bumbalm` de `~/miniconda3`, o mesmo da `main`. O cache do Hugging Face é o padrão (`~/.cache/huggingface`), também o mesmo da `main`.
+2. **Dados:** `~/bumbalm/Pares_Tribunais/pares_tjrs_amostra60k_camaras.jsonl` (`diretorio_base_pares` em `configs/h200/config_base*.yaml`). Com o mesmo arquivo e a mesma semente (42), o split é idêntico ao da V100.
+3. **Pacotes:** `sentence-transformers>=5` e `transformers>=4.51,<5`. O `peft` só é necessário com LoRA, que está desligado neste perfil.
 
 ## gpunode02 sem internet
-Os jobs rodam offline (`HF_HUB_OFFLINE=1` em `cluster/h200/caminhos.sh`). Tudo chega pela sua máquina:
+- O código chega por `git bundle` (ver passo a passo abaixo).
+- O modelo já está no cache padrão. Os scripts rodam com `HF_HUB_OFFLINE=1`, para não esperar o timeout de rede.
+- Pacotes que faltarem: `pip download` na sua máquina e `pip install --no-index` lá.
 
-| O que | Como |
-|---|---|
-| Código | `git bundle` da branch, copiado com `scp` e clonado no gpunode02 |
-| Amostra TJRS | Gerada no próprio gpunode02 com `scripts/amostrar_pares.py` (só biblioteca padrão), conferindo o SHA-256 com o manifesto do tapajós |
-| Modelo | Conferir se já está em `~/bumbalm/hf_cache/hub/models--Qwen--Qwen3-Embedding-4B`; se não, baixar na sua máquina e copiar |
-| Pacotes Python | Conferir as versões no ambiente; se faltar algo, `pip download` na sua máquina e `pip install --no-index` lá |
-
-O `peft` só é necessário com LoRA. Neste perfil o LoRA está desligado, então ele não precisa estar instalado.
+## Disco
+O nó tem pouco espaço livre. Um checkpoint de fine-tuning completo ocupa cerca de 24 GB (pesos + Adam), e o Trainer mantém 2 durante o treino. Com `apagar_checkpoints_ao_fim: true` (`configs/h200/config_train.yaml`), ao fim de cada variante fica só o `best_model_4b` (~8 GB) e o `trainer_state.json` com o histórico. Mesmo assim, o pico durante um treino é de cerca de 80 GB contando os dados: confira `df -h ~` antes da rodada real.
 
 ## Execução
 Da raiz do projeto, dentro de `tmux` ou `screen` (ou com `nohup`), para não perder o processo ao fechar o terminal:
@@ -58,6 +54,7 @@ bash cluster/h200/rodar.sh avaliar
 - **`Processos (GPUs) : 2`** e **`Negativos entre GPUs : True`**. Se aparecer `False`, a versão do sentence-transformers não junta os lotes das duas placas, e cada âncora vê só 31 concorrentes em vez de 63. Atualize a biblioteca antes da rodada real.
 - **`Precisao mista : bf16`** e **`Estrategia : Full Fine-Tuning`**.
 - **O tempo por passo** (`s/it`), para estimar a rodada inteira.
+- No relatório da mineração (`data/smoke_tjrs_h200/relatorio_mineracao_tripletos.txt`): quantas tuplas o teto relativo descartou e quantas ficaram com negativo acima do positivo (deve ser 0).
 
 ## Regra de ouro da ablação
 As três variantes (`nenhum`, `aleatorios`, `dificeis`) precisam rodar **com este mesmo perfil**. Não misture variantes treinadas na V100 com variantes treinadas na H200: a diferença viria do regime de treino, não dos negativos.

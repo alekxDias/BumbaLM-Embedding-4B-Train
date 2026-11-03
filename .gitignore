@@ -58,3 +58,6 @@ data/processed_*/
 data/smoke_*/
 logs/
 hf_cache/
+
+# Pacotes git para levar o codigo ao gpunode02 (sem internet)
+*.bundle

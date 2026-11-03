@@ -54,5 +54,5 @@ saidas:
   diretorio_experimentos: "experiments"
   # Cada variante de negativos grava em experiments/<nome_experimento>/<variante>/
   nome_experimento: "tcc_tjrs_ablacao_negativos_h200"
-  # Informativo: o cache real vem da variavel HF_HOME, definida em cluster/env.sh
-  hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"
+  # Informativo: no gpunode02 vale o cache padrao (~/.cache/huggingface), ver cluster/h200/caminhos.sh
+  hf_cache_dir: "~/.cache/huggingface"

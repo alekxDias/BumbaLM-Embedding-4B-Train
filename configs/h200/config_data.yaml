@@ -50,6 +50,10 @@ mineracao_negativos:
   n_negativos: 5
   limiar_similaridade_min: 0.60
   limiar_similaridade_max: 0.85
+  # Teto relativo (NV-Retriever, Moreira et al., 2024): negativo < 95% da similaridade do positivo
+  # com a consulta. O teto fixo de 0.85 deixava passar negativos acima de positivos fracos
+  # (70% das tuplas no smoke do TJRS). Vale tambem para os negativos aleatorios. null desliga.
+  max_relativo_positivo: 0.95
   top_k_candidatos: 200
   
   # Lotes de mineracao acelerada em GPU
