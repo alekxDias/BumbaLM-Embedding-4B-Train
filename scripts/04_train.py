@@ -31,6 +31,7 @@ import os
 import argparse
 import json
 import random
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -137,11 +138,27 @@ def _preparar_gpus(gpus: str) -> None:
     if len(ids) == 1:
         return
 
+    # Rendezvous fixo no loopback. O --standalone resolve o hostname do no (gpunode02), que no
+    # cluster aponta para uma interface sem rota: "errno 101 - Network is unreachable".
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        porta = sock.getsockname()[1]
+    # Um no so: NCCL e Gloo tambem ficam no loopback em vez de tentar a rede do cluster.
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
+
     comando = [
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--standalone",
+        "--nnodes",
+        "1",
+        "--node_rank",
+        "0",
+        "--master_addr",
+        "127.0.0.1",
+        "--master_port",
+        str(porta),
         "--nproc_per_node",
         str(len(ids)),
         str(Path(__file__).resolve()),

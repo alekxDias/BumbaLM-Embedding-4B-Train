@@ -1,11 +1,11 @@
 # Parametros de Treinamento
-# Perfil do TCC: uma Tesla V100S de 32 GB no cluster (sem bf16 nativo, sem FlashAttention 2).
+# Perfil do TCC: node2 (gpunode02) com duas NVIDIA H200 de 141 GB, bf16 nativo.
+# O perfil da V100S do tapajos esta na branch tcc/ablacao-negativos-tjma.
 
 hardware:
-  # Vazio: uma GPU. "1": somente a segunda placa.
   # "0,1": treino em DDP e mineracao nas duas placas.
-  # No PBS a GPU reservada ja vem em CUDA_VISIBLE_DEVICES: deixe vazio.
-  gpus: ""
+  # Vazio: uma GPU. "1": somente a segunda placa.
+  gpus: "0,1"
 
 modelo:
   model_id: "Qwen/Qwen3-Embedding-4B"
@@ -13,50 +13,53 @@ modelo:
   query_instruction: "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: "
   pooling_mode: "lasttoken"
   normalizar_embeddings: true
-  
-  # "sdpa" (nativo PyTorch 2.x). A V100 nao roda "flash_attention_2".
+
+  # "sdpa" (nativo PyTorch 2.x). Em bf16 na H200 ele ja usa o kernel flash do proprio PyTorch,
+  # sem depender do pacote flash-attn.
   attn_implementation: "sdpa"
 
-# Full fine-tuning de 4B nao cabe em 32 GB (pesos + gradientes + Adam passam de 60 GB).
-# Com LoRA a base fica congelada em fp16 e so os adaptadores treinam.
-# Na H200, ativo: false volta ao full fine-tuning do artigo.
+# Full fine-tuning, como no artigo (main). Na H200 cabe: pesos, gradientes e Adam em bf16 ~32 GB por placa.
+# ativo: true troca para LoRA (treino ~1,3x mais rapido e checkpoints de ~0,4 GB em vez de ~24 GB).
 lora:
-  ativo: true
+  ativo: false
   r: 16
   alpha: 32
   dropout: 0.05
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 treinamento:
-  # Lote contrastivo: cada ancora ve os positivos e negativos das outras 63 tuplas.
+  # Lote contrastivo por GPU. Com as duas placas e gather_across_devices, cada ancora
+  # disputa com as outras 127 tuplas do passo.
   # mini_batch_size so controla a memoria do GradCache, nao muda o resultado.
   batch_size_train: 64
-  mini_batch_size: 4
+  mini_batch_size: 16
   gradient_accumulation_steps: 1
-  
-  # "auto": bf16 na A100/H200, fp16 na V100.
+
+  # "auto": bf16 na H200.
   precisao: "auto"
-  gradient_checkpointing: true # Obrigatorio na V100
-  
+  gradient_checkpointing: false # Desligado: a H200 tem memoria de sobra e o passo fica mais rapido
+
   # Sorteia N tuplas (mesma semente nas tres variantes). null usa todas.
-  # Na V100 a variante com 5 negativos custa ~3,5x mais por tupla que a sem negativos.
-  limite_tuplas: null
-  
+  # A amostra de 60 mil acordaos gera ~500 mil tuplas (~10 chunks por acordao): 30 a 40 h por variante.
+  # Com 100 mil, a variante "dificeis" leva ~8 h e a "nenhum" ~3 h nas duas H200.
+  limite_tuplas: 100000
+
   # Otimizacao de alimentacao CPU -> GPU
   dataloader_num_workers: 4
   dataloader_pin_memory: false
-  
-  # Otimizador e escalonamento. LoRA pede LR maior que o full fine-tuning (2e-5 no artigo).
+
+  # Otimizador e escalonamento (os do artigo, full fine-tuning)
   num_epochs: 1
-  learning_rate: 1.0e-4
+  learning_rate: 2.0e-5
   weight_decay: 0.01
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
-  
-  # Frequencia de checkpoints e avaliacao
-  eval_steps: 100
-  save_steps: 100
-  save_total_limit: 2 # O melhor checkpoint e sempre mantido
+
+  # Frequencia de checkpoints e avaliacao. 100 mil tuplas / 128 por passo = ~780 passos.
+  eval_steps: 200
+  save_steps: 200
+  # 1: fica o ultimo e o melhor. Cada checkpoint do full fine-tuning tem ~24 GB.
+  save_total_limit: 1
   metric_for_best_model: "val_cosine_ndcg@10"
   greater_is_better: true
 
@@ -65,12 +68,12 @@ loss:
   scale: 50.0
 
 avaliacao:
-  eval_batch_size: 32
+  eval_batch_size: 128
   # Validacao durante o treino com amostra fixa de processos (mesma nas tres variantes).
-  # No TJRS sao ~11 chunks por processo: 300 processos = ~3.400 chunks = ~13 min por avaliacao na V100.
+  # No TJRS sao ~11 chunks por processo: 300 processos = ~3.400 chunks.
   # A Etapa 5 sempre usa o split de teste completo.
   max_processos_val: 300
-  # Precisao dos pesos na Etapa 5. "fp32" se aparecer NaN em fp16.
+  # Precisao dos pesos na Etapa 5.
   precisao: "auto"
   metricas:
     - "ndcg@10"

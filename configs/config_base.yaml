@@ -8,8 +8,8 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  # Cluster tapajos: amostra de 60 mil acordaos de Camara do TJRS (scripts/amostrar_pares.py)
-  diretorio_base_pares: "/projetos/ctcca/nlp/dados_tjrs"
+  # node2: amostra de 60 mil acordaos de Camara do TJRS, gerada por node2/rodar.sh amostra
+  diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
   diretorio_processados: "data/processed_tjrs"
 
   # Lista explicita dos arquivos de pares para processamento.
@@ -50,6 +50,6 @@ dados:
 saidas:
   diretorio_experimentos: "experiments"
   # Cada variante de negativos grava em experiments/<nome_experimento>/<variante>/
-  nome_experimento: "tcc_tjrs_ablacao_negativos"
-  # Informativo: o cache real vem da variavel HF_HOME, definida em cluster/env.sh
-  hf_cache_dir: "/projetos/ctcca/nlp/hf_cache"
+  nome_experimento: "tcc_tjrs_ablacao_negativos_h200"
+  # Informativo: o cache real vem da variavel HF_HOME, definida em node2/env.sh
+  hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"
