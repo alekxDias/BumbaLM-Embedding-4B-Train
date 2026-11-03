@@ -251,6 +251,9 @@ def main() -> None:
         "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: ",
     )
     attn_impl = modelo_cfg.get("attn_implementation", "sdpa")
+    # Mesmo limite do treino e da avaliacao. Com 1024, ementas longas estouravam a V100
+    # (a atencao cresce com o quadrado do comprimento) e a mineracao via textos que o treino corta.
+    max_seq_len = int(modelo_cfg.get("max_seq_length", 768))
     gpus_txt = _resolver_gpus(args, cfg_train)
     dispositivos = _dispositivos_cuda(gpus_txt)
 
@@ -265,7 +268,7 @@ def main() -> None:
     print(f"GPUs da mineracao   : {gpus_txt or 'padrao (uma placa)'}")
     print(f"Faixa de Cosseno    : [{lim_min}, {lim_max}] | TOP_K: {top_k}")
     print(f"Negativos por Chunk : {n_neg}")
-    print(f"Batch Inferencia    : {encode_batch} | Batch Queries: {query_batch}")
+    print(f"Batch Inferencia    : {encode_batch} | Batch Queries: {query_batch} | Max tokens: {max_seq_len}")
     print(f"Tripletos           : {'recomecar do zero' if args.recompute_triplets else 'retomar se o arquivo existir'}")
     print("-" * 64)
 
@@ -279,6 +282,7 @@ def main() -> None:
     # 2. Inicializacao do modelo
     modelo = carregar_modelo_mineracao(
         model_id=model_id,
+        max_seq_len=max_seq_len,
         device=args.device,
         attn_implementation=attn_impl,
     )

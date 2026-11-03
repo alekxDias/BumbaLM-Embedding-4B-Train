@@ -46,7 +46,7 @@ def preparar_query_com_instrucao(query: str, instrucao: str = DEFAULT_QUERY_INST
 
 def carregar_modelo_mineracao(
     model_id: str = "Qwen/Qwen3-Embedding-4B",
-    max_seq_len: int = 1024,
+    max_seq_len: int = 768,
     device: Optional[str] = None,
     attn_implementation: str = "sdpa",
 ) -> SentenceTransformer:
