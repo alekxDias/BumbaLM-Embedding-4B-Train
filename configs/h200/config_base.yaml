@@ -1,0 +1,58 @@
+# Perfil 2x H200 (141 GB). Gerado a partir de configs/config_base.yaml. So mudam os valores que dependem do hardware;
+# o resto deve continuar igual ao perfil da V100 (compare com: diff configs/config_base.yaml configs/h200/config_base.yaml).
+# Configuracoes Gerais e de Caminhos - Pipeline BumbaLM-Embedding-4B
+
+projeto:
+  nome: "BumbaLM-Embedding-4B-Train"
+  versao: "2.0.0"
+  descricao: "Pipeline modular para treinamento contrastivo de embeddings juridicos brasileiros"
+  seed: 42
+
+# Caminhos dos Dados
+dados:
+  # Maquina das H200: copie para ca o mesmo pares_tjrs_amostra60k_camaras.jsonl do tapajos.
+  # Mesmo arquivo e mesma semente = mesmo split da V100.
+  diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
+  diretorio_processados: "data/processed_tjrs_h200"
+
+  # Lista explicita dos arquivos de pares para processamento.
+  # Comente ou descomente as linhas para incluir ou excluir tribunais:
+  arquivos_pares:
+    # --- TCC: ablacao de negativos com o TJRS. O pares_tjma.jsonl (Turmas Recursais) nao sustenta a tarefa ---
+    - "pares_tjrs_amostra60k_camaras.jsonl"
+
+    # --- TRIBUNAIS DE JUSTICA ESTADUAIS (rodada multi-tribunal, desativados no TCC) ---
+    # - "pares_tjba.jsonl"
+    # - "pares_tjdf.jsonl"
+    # - "pares_tjes.jsonl"
+    # - "pares_tjms.jsonl"
+    # - "pares_tjpa.jsonl"
+    # - "pares_tjpb.jsonl"
+    # - "pares_tjpr.jsonl"
+    # - "pares_tjrn.jsonl"
+    # - "pares_tjro.jsonl"
+    # - "pares_tjrr.jsonl"
+    # - "pares_tjrs.jsonl"
+
+    # --- TRIBUNAIS SUPERIORES E ESPECIALIZADOS (DESATIVADOS NESTE TESTE) ---
+    # - "pares_stf.jsonl"
+    # - "pares_tst.jsonl"
+    # - "pares_tse.jsonl"
+    # - "pares_stm.jsonl"
+    # - "pares_tcu.jsonl"
+    # - "pares_cnj.jsonl"
+  
+  # Mapeamento flexivel de nomes de colunas do arquivo bruto
+  colunas:
+    tribunal: "str_tribunal"          # Coluna com sigla do tribunal (ex.: TJMA, TJSP, TRF1)
+    numero_processo: "str_numero_unico" # Coluna com numero CNJ ou identificador do processo
+    ementa: "str_ementa"              # Coluna com o texto da ementa (query)
+    inteiro_teor: "str_inteiro_teor"  # Coluna com o texto integral da decisao
+
+# Diretorios de Saida de Modelos e Logs
+saidas:
+  diretorio_experimentos: "experiments"
+  # Cada variante de negativos grava em experiments/<nome_experimento>/<variante>/
+  nome_experimento: "tcc_tjrs_ablacao_negativos_h200"
+  # Informativo: o cache real vem da variavel HF_HOME, definida em cluster/env.sh
+  hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"

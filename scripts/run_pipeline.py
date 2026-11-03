@@ -169,7 +169,24 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="config_base.yaml repassado a todas as etapas. Ex.: configs/config_base_smoke.yaml.",
     )
+    parser.add_argument(
+        "--config_data",
+        type=Path,
+        default=None,
+        help="config_data.yaml repassado as etapas que o leem (split, chunk, mine, random, train).",
+    )
+    parser.add_argument(
+        "--config_train",
+        type=Path,
+        default=None,
+        help="config_train.yaml repassado as etapas que o leem (mine, train, eval). Ex.: configs/h200/config_train.yaml.",
+    )
     return parser.parse_args()
+
+
+# Etapas que aceitam cada arquivo de configuracao. Repassar a quem nao aceita quebra o argparse.
+ETAPAS_COM_CONFIG_DATA = {"split", "chunk", "mine", "random", "train"}
+ETAPAS_COM_CONFIG_TRAIN = {"mine", "train", "eval"}
 
 
 def executar_comando(comando: list[str], nome_etapa: str) -> bool:
@@ -255,6 +272,10 @@ def main() -> None:
         cmd = [python_bin, script_path]
         if args.config_base:
             cmd.extend(["--config_base", str(args.config_base)])
+        if args.config_data and etapa in ETAPAS_COM_CONFIG_DATA:
+            cmd.extend(["--config_data", str(args.config_data)])
+        if args.config_train and etapa in ETAPAS_COM_CONFIG_TRAIN:
+            cmd.extend(["--config_train", str(args.config_train)])
 
         if etapa == "split":
             if args.input:
