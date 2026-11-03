@@ -5,6 +5,14 @@
 source "$(dirname "${BASH_SOURCE[0]}")/caminhos.sh"
 conda activate "$AMBIENTE_DIR"
 
+# Dentro de um job, temporarios no disco local do no. No /projetos (NFS) os workers do
+# DataLoader deixam arquivos .nfsXXXX abertos e a limpeza no fim imprime
+# "Device or resource busy". O TMPDIR do caminhos.sh fica para a instalacao no no de login.
+if [ -n "$PBS_JOBID" ]; then
+    export TMPDIR="/tmp/bumbalm_${PBS_JOBID%%.*}"
+    mkdir -p "$TMPDIR"
+fi
+
 # Igual ao exemplo do orientador
 module load cuda 2>/dev/null || true
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CONDA_PREFIX/lib/

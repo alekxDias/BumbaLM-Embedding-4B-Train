@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib
 import json
 import logging
 import sys
@@ -149,17 +150,65 @@ def descobrir_variantes(dir_experimento: Path) -> dict[str, str]:
     return modelos
 
 
+def _carregar_checkpoint_lora(pasta: Path, dispositivo: str, dtype: torch.dtype, max_seq_length: int) -> SentenceTransformer:
+    """
+    Checkpoint de treino com LoRA guarda so o adaptador (adapter_config.json e
+    adapter_model.safetensors), sem o config.json do modelo base: SentenceTransformer(pasta)
+    falha com "Unrecognized model". Monta o Transformer a partir do modelo base, le os demais
+    modulos (pooling, normalizacao) da propria pasta e aplica o adaptador por cima.
+    """
+    from sentence_transformers import models
+
+    base = json.loads((pasta / "adapter_config.json").read_text(encoding="utf-8"))["base_model_name_or_path"]
+    modulos = []
+    transformer = None
+    for entrada in json.loads((pasta / "modules.json").read_text(encoding="utf-8")):
+        if entrada.get("path", "") == "":
+            transformer = models.Transformer(
+                base,
+                max_seq_length=max_seq_length,
+                model_args={"torch_dtype": dtype, "trust_remote_code": True},
+                tokenizer_args={"padding_side": "left"},
+            )
+            modulos.append(transformer)
+        else:
+            nome_modulo, nome_classe = entrada["type"].rsplit(".", 1)
+            classe = getattr(importlib.import_module(nome_modulo), nome_classe)
+            modulos.append(classe.load(str(pasta / entrada["path"])))
+    if transformer is None:
+        raise ValueError(f"modules.json de {pasta} nao tem o modulo Transformer na raiz.")
+
+    transformer.auto_model.load_adapter(str(pasta))
+    modelo = SentenceTransformer(modules=modulos, device=dispositivo)
+
+    # Confere que o adaptador muda a saida: um LoRA que nao foi aplicado avaliaria o modelo base
+    sonda = ["recurso de apelacao conhecido e desprovido"]
+    com = modelo.encode(sonda, convert_to_tensor=True).float()
+    transformer.auto_model.disable_adapters()
+    sem = modelo.encode(sonda, convert_to_tensor=True).float()
+    transformer.auto_model.enable_adapters()
+    diferenca = 1 - torch.nn.functional.cosine_similarity(com, sem).item()
+    print(f"  - LoRA de {pasta.name} aplicado sobre {base} (distancia da saida para o base: {diferenca:.4f})")
+    if diferenca < 1e-6:
+        print("  - AVISO: o adaptador nao mudou a saida. Este modelo vai se comportar como o base.")
+    return modelo
+
+
 def carregar_modelo_avaliacao(caminho: str, max_seq_length: int, precisao: str = "auto") -> SentenceTransformer:
     """Carrega na precisao da GPU com padding a esquerda, exigido pelo last-token pooling."""
     dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = dtype_para_dispositivo(dispositivo, precisao)
-    modelo = SentenceTransformer(
-        caminho,
-        trust_remote_code=True,
-        device=dispositivo,
-        model_kwargs={"torch_dtype": dtype},
-        tokenizer_kwargs={"padding_side": "left"},
-    )
+    pasta = Path(caminho)
+    if pasta.is_dir() and (pasta / "adapter_config.json").is_file():
+        modelo = _carregar_checkpoint_lora(pasta, dispositivo, dtype, max_seq_length)
+    else:
+        modelo = SentenceTransformer(
+            caminho,
+            trust_remote_code=True,
+            device=dispositivo,
+            model_kwargs={"torch_dtype": dtype},
+            tokenizer_kwargs={"padding_side": "left"},
+        )
     # Mesmo limite do treino para todos. O base no Hub viria com 32k tokens.
     modelo.max_seq_length = max_seq_length
     return modelo

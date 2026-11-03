@@ -26,6 +26,10 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+import json
+
+import numpy as np
+
 from src.evaluation.ir_evaluator import carregar_chunks_jsonl, carregar_processos_jsonl
 from src.mining.random_negatives import gerar_tuplas_negativos_aleatorios
 
@@ -84,6 +88,26 @@ def main() -> None:
     processos = carregar_processos_jsonl(dir_processados / "train_processos.jsonl")
     grupo_por_processo = {p.id_global: p.grupo_duplicata for p in processos}
 
+    # Teto relativo: vetores do corpus (Etapa 3) e das consultas (gravados pela mineracao)
+    max_relativo = cfg_data.get("mineracao_negativos", {}).get("max_relativo_positivo", 0.95)
+    vetores_consultas = None
+    corpus_embs = None
+    pasta_consultas = dir_processados / "train_triplets_consultas"
+    arq_corpus = dir_processados / "corpus_embeddings_f16.npy"
+    if max_relativo:
+        if not pasta_consultas.is_dir() or not arq_corpus.is_file():
+            raise FileNotFoundError(
+                f"Teto relativo ligado, mas faltam {pasta_consultas} ou {arq_corpus}. Rode a Etapa 3 antes."
+            )
+        corpus_embs = np.load(arq_corpus, mmap_mode="r")
+        vetores_consultas = {}
+        for arq in sorted(pasta_consultas.glob("lote_*.npy")):
+            ids = json.loads(arq.with_suffix(".json").read_text(encoding="utf-8"))
+            for pid, vetor in zip(ids, np.load(arq).astype(np.float32)):
+                vetores_consultas[pid] = vetor
+        print(f"Teto relativo: negativo < {float(max_relativo):.0%} do positivo | "
+              f"{len(vetores_consultas):,} consultas com vetor")
+
     stats = gerar_tuplas_negativos_aleatorios(
         arquivo_tuplas_dificeis=arq_tuplas,
         chunks_corpus=chunks,
@@ -91,12 +115,18 @@ def main() -> None:
         n_negativos=n_neg,
         seed=seed,
         grupo_por_processo=grupo_por_processo,
+        vetores_consultas=vetores_consultas,
+        corpus_embs=corpus_embs,
+        max_relativo_positivo=float(max_relativo) if max_relativo else None,
     )
 
     print("-" * 64)
     print(f"Tuplas lidas          : {stats['tuplas_lidas']:,}")
     print(f"Tuplas gravadas       : {stats['tuplas_gravadas']:,}")
     print(f"Tuplas sem negativos  : {stats['tuplas_sem_negativos']:,}")
+    print(f"Sorteios rejeitados pelo teto relativo: {stats['rejeitados_teto_relativo']:,}")
+    if stats["tuplas_sem_vetor_da_consulta"]:
+        print(f"AVISO: {stats['tuplas_sem_vetor_da_consulta']:,} tuplas sem vetor da consulta (sorteadas sem o teto)")
     print(f"Arquivo salvo em      : {arq_saida}")
     print("Etapa 3b finalizada com sucesso.")
 

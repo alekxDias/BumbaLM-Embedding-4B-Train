@@ -243,6 +243,8 @@ def main() -> None:
     encode_batch = mining_cfg.get("encode_batch_size", 256)
     query_batch = mining_cfg.get("query_batch_size", 256)
     bloco_vetorizacao = int(mining_cfg.get("bloco_vetorizacao", 20000))
+    max_relativo = mining_cfg.get("max_relativo_positivo", 0.95)
+    max_relativo = None if max_relativo is None else float(max_relativo)
 
     # Parametros do modelo e instrucao
     modelo_cfg = cfg_train.get("modelo", {})
@@ -269,6 +271,7 @@ def main() -> None:
     print(f"GPUs da mineracao   : {gpus_txt or 'padrao (uma placa)'}")
     print(f"Faixa de Cosseno    : [{lim_min}, {lim_max}] | TOP_K: {top_k}")
     print(f"Negativos por Chunk : {n_neg}")
+    print(f"Teto relativo       : {'negativo < ' + format(max_relativo, '.0%') + ' do positivo' if max_relativo else 'desligado'}")
     print(f"Batch Inferencia    : {encode_batch} | Batch Queries: {query_batch} | Max tokens: {max_seq_len}")
     print(f"Tripletos           : {'recomecar do zero' if args.recompute_triplets else 'retomar se o arquivo existir'}")
     print("-" * 64)
@@ -308,6 +311,7 @@ def main() -> None:
         dispositivos=dispositivos or None,
         retomar=not args.recompute_triplets,
         bloco_vetorizacao=bloco_vetorizacao,
+        max_relativo_positivo=max_relativo,
     )
 
     # 4. Emissao de relatorio de mineracao
@@ -318,6 +322,9 @@ def main() -> None:
         f.write("=" * 64 + "\n\n")
         f.write(f"Modelo Utilizado         : {model_id}\n")
         f.write(f"Faixa de Similaridade    : [{lim_min}, {lim_max}]\n")
+        f.write(f"Teto relativo ao positivo: {max_relativo if max_relativo else 'desligado'} "
+                "(negativo < teto x similaridade do positivo com a consulta)\n")
+        f.write(f"Tuplas descartadas pelo teto relativo: {stats.get('tuplas_descartadas_filtro_relativo', 0):,}\n")
         f.write(f"Negativos por Instancia  : {n_neg}\n")
         f.write(f"Processos Avaliados      : {stats['processos_avaliados']:,}\n")
         f.write(f"Processos ja gravados    : {stats.get('processos_pulados', 0):,}\n")
@@ -359,6 +366,7 @@ def main() -> None:
     print(f"  - Chunks sem 5 negativos        : {stats['chunks_sem_negativos_suficientes']:,}")
     print(f"  - Margem media (pos - neg max)  : {stats['media_margem_tripletos']:.4f}")
     print(f"  - Negativo acima do positivo    : {stats.get('tuplas_com_negativo_acima_do_positivo', 0):,} tuplas")
+    print(f"  - Descartadas pelo teto relativo: {stats.get('tuplas_descartadas_filtro_relativo', 0):,} tuplas")
     dist = stats.get("distribuicao_scores") or {}
     for nome in ("melhor_candidato", "candidato_50", "melhor_positivo"):
         if nome in dist:
