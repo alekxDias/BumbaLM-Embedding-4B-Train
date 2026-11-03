@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import random
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -45,7 +47,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data_dir", type=Path, default=None)
     parser.add_argument("--split", choices=["train", "val", "test"], default="test")
     parser.add_argument("--exemplos", type=int, default=3, help="Exemplos impressos por caso.")
+    parser.add_argument(
+        "--bruto",
+        action="store_true",
+        help="Le o arquivo de pares bruto (config_base) em vez dos splits. Sem chunks: secoes 5 e 6 ficam vazias.",
+    )
+    parser.add_argument("--amostra", type=int, default=3000, help="Com --bruto: processos sorteados do arquivo inteiro.")
+    parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
+
+
+# Numero CNJ depois de normalizar: "0800666 57 2015 8 10 0011"
+_RE_CNJ = re.compile(r"\b\d{7} \d{2} \d{4} \d \d{2} \d{4}\b")
+_CABECALHO = ("sessao do dia", "recorrente", "recorrido", "advogad", "relator", "origem")
+
+
+def _carregar_bruto(cfg: dict, amostra: int, seed: int) -> list:
+    """Le os pares brutos com a mesma limpeza da Etapa 1 e sorteia uma amostra do arquivo inteiro."""
+    from src.data.cleaner import carregar_e_filtrar_processos
+
+    dados = cfg.get("dados", {})
+    base = Path(dados.get("diretorio_base_pares", "."))
+    caminhos = [base / a for a in dados.get("arquivos_pares", [])]
+    processos, _ = carregar_e_filtrar_processos(
+        caminho_arquivo=caminhos,
+        mapeamento_colunas=dados.get("colunas", {}),
+    )
+    print(f"Processos validos no arquivo bruto: {len(processos):,}")
+    if amostra and len(processos) > amostra:
+        processos = random.Random(seed).sample(processos, amostra)
+    return processos
 
 
 def _faixa(valor: float, cortes: list[float]) -> str:
@@ -82,8 +113,14 @@ def main() -> None:
     if not dir_dados.is_absolute():
         dir_dados = BASE_DIR / dir_dados
 
-    processos = carregar_processos_jsonl(dir_dados / f"{args.split}_processos.jsonl")
-    chunks = carregar_chunks_jsonl(dir_dados / f"{args.split}_corpus_chunks.jsonl")
+    if args.bruto:
+        processos = _carregar_bruto(cfg, args.amostra, args.seed)
+        chunks = []
+        rotulo = f"arquivo bruto, amostra aleatoria de {len(processos):,}"
+    else:
+        processos = carregar_processos_jsonl(dir_dados / f"{args.split}_processos.jsonl")
+        chunks = carregar_chunks_jsonl(dir_dados / f"{args.split}_corpus_chunks.jsonl")
+        rotulo = f"split {args.split}"
     chunks_por_proc: dict[str, list] = defaultdict(list)
     for ch in chunks:
         chunks_por_proc[ch.processo_id].append(ch)
@@ -106,8 +143,12 @@ def main() -> None:
     ex_frases: list[tuple] = []
     ex_bloco: list[tuple] = []
     ex_chunk_na_ementa: list[tuple] = []
+    sobra_teor = Counter()
+    composicao = Counter()
+    ex_ementa_bruta: list[tuple] = []
 
     cortes = [0, 0.25, 0.5, 0.8, 0.999, 1.01]
+    cortes_sobra = [0, 100, 300, 500, 1000, 10**9]
     for proc in processos:
         e_txt = remover_rotulos_iniciais(normalizar_texto_auditoria(proc.ementa))
         t_txt = normalizar_texto_auditoria(proc.inteiro_teor)
@@ -130,6 +171,29 @@ def main() -> None:
         cob_total, _ = cobertura_ementa(e_pal, t_pal, 6)
         faixa_cobertura_total[_faixa(cob_total, cortes)] += 1
 
+        # Quanto texto do teor sobra fora do bloco da ementa (o que poderia virar positivo)
+        sobra = len(t_pal) - (tam if frac_contiguo >= 0.5 else 0)
+        for inicio, fim in zip(cortes_sobra, cortes_sobra[1:]):
+            if inicio <= sobra < fim:
+                sobra_teor[(inicio, fim)] += 1
+                break
+
+        # Tipo de decisao e cabecalho dentro do campo ementa
+        inicio_teor = t_txt[:3000]
+        if "turma recursal" in inicio_teor or "recurso inominado" in inicio_teor:
+            composicao["turma recursal / recurso inominado"] += 1
+        elif "camara" in inicio_teor or "apelacao" in inicio_teor:
+            composicao["camara / apelacao"] += 1
+        else:
+            composicao["outro"] += 1
+        inicio_ementa = e_txt[:400]
+        if _RE_CNJ.search(e_txt):
+            composicao["(ementa contem o numero do processo)"] += 1
+        if sum(rotulo_cab in inicio_ementa for rotulo_cab in _CABECALHO) >= 2:
+            composicao["(ementa comeca com cabecalho: sessao/partes/advogados)"] += 1
+        if len(ex_ementa_bruta) < args.exemplos:
+            ex_ementa_bruta.append((proc.id, proc.ementa[:500]))
+
         meus = chunks_por_proc.get(proc.id, [])
         if meus and all(c.contem_vazamento_ementa for c in meus):
             sem_limpo_por_tipo["ementa em bloco (>=80% contigua)" if frac_contiguo >= 0.8 else "so frases da ementa"] += 1
@@ -150,7 +214,7 @@ def main() -> None:
 
     n = sum(ocorrencias.values())
     p("=" * 72)
-    p(f"DIAGNOSTICO DE VAZAMENTO - split {args.split} ({n} processos) - {dir_dados}")
+    p(f"DIAGNOSTICO DE VAZAMENTO - {rotulo} ({n} processos) - {dir_dados}")
     p("=" * 72)
     p("\n1. A ementa INTEIRA (identica, apos normalizar) aparece no teor quantas vezes?")
     for k in ("0", "1", "2+"):
@@ -177,6 +241,14 @@ def main() -> None:
     p("\n6. Processos SEM nenhum chunk limpo, por tipo:")
     for k, v in sem_limpo_por_tipo.most_common():
         p(f"   - {k}: {v}")
+    p("\n7. Palavras do teor FORA do bloco da ementa (~500 palavras = 1 chunk de 768 tokens):")
+    for (inicio, fim) in zip(cortes_sobra, cortes_sobra[1:]):
+        v = sobra_teor[(inicio, fim)]
+        rotulo_faixa = f">= {inicio}" if fim > 10**8 else f"{inicio}-{fim - 1}"
+        p(f"   {rotulo_faixa:<10}: {v:>6} ({v / max(1, n):.0%})")
+    p("\n8. Tipo de decisao (inicio do teor) e cabecalho no campo ementa:")
+    for k, v in composicao.most_common():
+        p(f"   - {k}: {v} ({v / max(1, n):.0%})")
 
     p("\n" + "-" * 72)
     p("EXEMPLOS: chunk marcado por 'trecho' que cobre < 30% da ementa (frase em comum)")
@@ -188,8 +260,12 @@ def main() -> None:
     p("\nEXEMPLOS: 'chunk_na_ementa' (chunk inteiro contido na ementa)")
     for pid, idx, total, txt in ex_chunk_na_ementa:
         p(f"\n[{pid} chunk {idx} de {total}] \"{txt}\"")
+    p("\nEXEMPLOS: inicio do campo ementa, como esta no arquivo (500 caracteres)")
+    for pid, txt in ex_ementa_bruta:
+        p(f"\n[{pid}] \"{txt}\"")
 
-    destino = dir_dados / f"diagnostico_vazamento_{args.split}.txt"
+    dir_dados.mkdir(parents=True, exist_ok=True)
+    destino = dir_dados / f"diagnostico_vazamento_{'bruto' if args.bruto else args.split}.txt"
     destino.write_text("\n".join(saida) + "\n", encoding="utf-8")
     print(f"\nSalvo em: {destino}")
 
