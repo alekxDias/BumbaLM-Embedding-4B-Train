@@ -59,6 +59,7 @@ def construir_modelo_embedding(
     device: Optional[str] = None,
     precisao: str = "auto",
     lora: Optional[dict[str, Any]] = None,
+    pesos_fp32: bool = False,
 ) -> SentenceTransformer:
     """
     Instancia e configura o pipeline SentenceTransformer:
@@ -75,6 +76,8 @@ def construir_modelo_embedding(
         device: Dispositivo de execucao ('cuda', 'cuda:0', 'cuda:1' ou 'cpu').
         precisao: "auto", "bf16", "fp16" ou "fp32". "auto" usa fp16 na V100 e bf16 da Ampere em diante.
         lora: Configuracao do LoRA ({"ativo": True, "r": 16, ...}). None ou ativo=False faz Full Fine-Tuning.
+        pesos_fp32: No full fine-tuning, carrega os pesos em fp32 e deixa o bf16 so na autocast do Trainer.
+            Sem isso, na H200 pesos, gradientes e Adam ficam todos em bf16 (bf16 "puro").
 
     Returns:
         Instancia de SentenceTransformer pronta para fine-tuning.
@@ -90,6 +93,9 @@ def construir_modelo_embedding(
     dtype_modelo = dtype_para_dispositivo(device, precisao)
     # Full fine-tuning em fp16 precisa dos pesos mestres em fp32. So o LoRA mantem a base em fp16.
     if dtype_modelo == torch.float16 and not usar_lora:
+        dtype_modelo = torch.float32
+    # Em bf16 puro, atualizacoes de ~2e-5 somem no arredondamento de pesos da ordem de 1e-2
+    if pesos_fp32 and not usar_lora and em_cuda:
         dtype_modelo = torch.float32
 
     rank = os.environ.get("RANK", "0")

@@ -5,6 +5,7 @@
 #   bash node2/rodar.sh amostra     # sorteia os 60 mil acordaos de Camara do pares_tjrs.jsonl
 #   bash node2/rodar.sh smoke       # ponta a ponta com 500 acordaos e 640 tuplas por variante
 #   bash node2/rodar.sh preparar    # split, chunk, mineracao dos dificeis e sorteio dos aleatorios
+#   bash node2/rodar.sh diagnostico # depois do preparar: base no teste completo + 2 treinos curtos (~1,5 h)
 #   bash node2/rodar.sh treinar     # as tres variantes, uma de cada vez
 #   bash node2/rodar.sh avaliar     # teste completo das variantes e do modelo base
 #   bash node2/rodar.sh completo    # preparar + treinar + avaliar
@@ -118,6 +119,43 @@ treinar() {
     done
 }
 
+# Treino curto da variante "nenhum" (a mais barata): loss e grad_norm a cada passo e validacao
+# a cada 5 passos, comecando no modelo base. Nao grava checkpoint nem modelo.
+DIAGNOSTICO="experiments/diagnostico_h200"
+DIAG_TUPLAS="${DIAG_TUPLAS:-5120}"
+
+diagnostico_treino() {
+    local nome="$1"
+    shift
+    if [ -f "$DIAGNOSTICO/$nome/metricas_treino_val.csv" ]; then
+        echo "Diagnostico '$nome' ja feito. Pulando." | tee -a "$LOG"
+        return 0
+    fi
+    python -u scripts/04_train.py --negativos nenhum --gpus 0,1 --diagnostico \
+        --limite_tuplas "$DIAG_TUPLAS" --eval_steps 5 --warmup_ratio 0.1 \
+        --output_dir "$DIAGNOSTICO/$nome" "$@" 2>&1 | tee -a "$LOG"
+}
+
+# Tabela por passo: loss, grad_norm, LR e as metricas de validacao
+resumo_diagnostico() {
+    python - "$DIAGNOSTICO" <<'EOF'
+import csv, math, sys
+from pathlib import Path
+
+raiz = Path(sys.argv[1])
+print("Loss de quem chuta ao acaso na variante 'nenhum' (128 candidatos): ln(128) = %.2f" % math.log(128))
+for arq in sorted(raiz.glob("*/metricas_treino_val.csv")):
+    linhas = list(csv.DictReader(arq.open(encoding="utf-8")))
+    colunas = ["step", "loss", "grad_norm", "learning_rate"]
+    colunas += sorted({c for l in linhas for c in l if c.endswith(("ndcg@10", "mrr@10"))})
+    print(f"\n=== {arq.parent.name} ===")
+    print(" | ".join(c.replace("eval_val_cosine_", "val_") for c in colunas))
+    for l in linhas:
+        if any(l.get(c) for c in colunas[1:]):
+            print(" | ".join((l.get(c) or "-")[:10] for c in colunas))
+EOF
+}
+
 echo "node2/rodar.sh $MODO | $(hostname) | $(date)" | tee -a "$LOG"
 
 case "$MODO" in
@@ -144,6 +182,24 @@ case "$MODO" in
         exigir_amostra
         exigir_espaco 50
         pipeline --steps split,chunk,mine,random --gpus 0,1
+        ;;
+    diagnostico)
+        if [ ! -f data/processed_tjrs/train_tuplas_aleatorias.jsonl ]; then
+            echo "ERRO: rode antes 'bash node2/rodar.sh preparar' (falta data/processed_tjrs/train_tuplas_aleatorias.jsonl)." | tee -a "$LOG"
+            exit 1
+        fi
+        exigir_espaco 20
+        # 1. Modelo base no teste completo: quanto sobra de margem para o ajuste mostrar ganho
+        if [ ! -f "$DIAGNOSTICO/base_teste/avaliacao_consolidada.json" ]; then
+            python -u scripts/05_evaluate.py --split test --compare_baseline \
+                --experimento_dir "$DIAGNOSTICO/sem_variantes" \
+                --output_dir "$DIAGNOSTICO/base_teste" 2>&1 | tee -a "$LOG"
+        fi
+        # 2. Como o smoke, mas com warmup: se a loss do passo 1 ja vier alta, o problema e o forward
+        diagnostico_treino A_bf16_puro
+        # 3. Pesos em fp32 (bf16 so na autocast): se A divergir e B nao, a causa e o bf16 puro
+        diagnostico_treino B_pesos_fp32 --pesos_fp32 --gradient_checkpointing
+        resumo_diagnostico 2>&1 | tee -a "$LOG" | tee "$DIAGNOSTICO/resumo.txt"
         ;;
     treinar)
         exigir_espaco 60

@@ -38,6 +38,13 @@ treinamento:
   # "auto": bf16 na H200.
   precisao: "auto"
   gradient_checkpointing: false # Desligado: a H200 tem memoria de sobra e o passo fica mais rapido
+  # false: pesos, gradientes e Adam em bf16 ("bf16 puro", ~32 GB). true: pesos em fp32 e bf16 so na
+  # autocast (~64 GB, pede gradient_checkpointing: true). Decidir pelo node2/rodar.sh diagnostico.
+  pesos_fp32: false
+
+  # Loss e grad_norm a cada N passos. A validacao no passo 0 mede o modelo base na mesma curva.
+  logging_steps: 10
+  avaliar_no_inicio: true
 
   # Sorteia N tuplas (mesma semente nas tres variantes). null usa todas.
   # A amostra de 60 mil acordaos gera ~500 mil tuplas (~10 chunks por acordao): 30 a 40 h por variante.

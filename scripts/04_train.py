@@ -19,6 +19,7 @@ Uso:
     python scripts/04_train.py --negativos nenhum
     python scripts/04_train.py --negativos aleatorios --limite_tuplas 50000
     python scripts/04_train.py --gpus 0,1
+    python scripts/04_train.py --negativos nenhum --limite_tuplas 5120 --diagnostico --output_dir experiments/diag/A
 """
 
 from __future__ import annotations
@@ -261,6 +262,30 @@ def parse_args() -> argparse.Namespace:
         help="Sobrescreve a frequencia de avaliacao intermediaria (eval_steps).",
     )
     parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=None,
+        help="Sobrescreve treinamento.warmup_ratio.",
+    )
+    parser.add_argument(
+        "--pesos_fp32",
+        action="store_true",
+        help="Full fine-tuning com pesos em fp32 e bf16 so na autocast. Sobrescreve treinamento.pesos_fp32.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Liga o gradient checkpointing (necessario com --pesos_fp32 na H200).",
+    )
+    parser.add_argument(
+        "--diagnostico",
+        action="store_true",
+        help=(
+            "Treino curto para conferir a otimizacao: loss e grad_norm a cada passo, validacao antes do "
+            "1o passo e nenhum checkpoint ou modelo gravado."
+        ),
+    )
+    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -330,13 +355,16 @@ def main() -> None:
     lr = args.lr or train_cfg.get("learning_rate", 2.0e-5)
     weight_decay = train_cfg.get("weight_decay", 0.01)
     epochs = args.epochs or train_cfg.get("num_epochs", 1)
-    warmup_ratio = train_cfg.get("warmup_ratio", 0.05)
+    warmup_ratio = args.warmup_ratio if args.warmup_ratio is not None else train_cfg.get("warmup_ratio", 0.05)
     precisao = str(train_cfg.get("precisao", "auto"))
     limite_tuplas = args.limite_tuplas or train_cfg.get("limite_tuplas")
     save_total_limit = int(train_cfg.get("save_total_limit", 2))
     cfg_lora = cfg_train.get("lora", {}) or {}
     usar_lora = bool(cfg_lora.get("ativo", False))
-    grad_checkpointing = train_cfg.get("gradient_checkpointing", False)
+    grad_checkpointing = args.gradient_checkpointing or train_cfg.get("gradient_checkpointing", False)
+    pesos_fp32 = args.pesos_fp32 or bool(train_cfg.get("pesos_fp32", False))
+    logging_steps = 1 if args.diagnostico else int(train_cfg.get("logging_steps", 10))
+    avaliar_no_inicio = args.diagnostico or bool(train_cfg.get("avaliar_no_inicio", False))
     num_workers = train_cfg.get("dataloader_num_workers", 4)
     pin_memory = train_cfg.get("dataloader_pin_memory", False)
     eval_steps = train_cfg.get("eval_steps", 250)
@@ -362,6 +390,9 @@ def main() -> None:
     _imprimir(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
     _imprimir(f"Precisao mista       : {precisao_mista} | Atencao: {attn_impl}")
     _imprimir(f"LoRA                 : {usar_lora} | Limite de tuplas: {limite_tuplas or 'todas'}")
+    _imprimir(f"Pesos em fp32        : {pesos_fp32} | Gradient checkpointing: {grad_checkpointing}")
+    if args.diagnostico:
+        _imprimir("Modo diagnostico     : log a cada passo, validacao no passo 0, sem checkpoints")
     _imprimir(f"Dataloader Workers   : {num_workers} | Pin Memory: {pin_memory}")
     _imprimir("-" * 64)
 
@@ -374,6 +405,7 @@ def main() -> None:
         device=dispositivo,
         precisao=precisao,
         lora=cfg_lora,
+        pesos_fp32=pesos_fp32,
     )
 
     # 2. Carregamento do Dataset de Tripletos
@@ -445,6 +477,8 @@ def main() -> None:
         save_total_limit=save_total_limit,
         # Com LoRA o checkpoint guarda so o adaptador. O melhor e avaliado pelo caminho, na Etapa 5.
         carregar_melhor_no_fim=not usar_lora,
+        logging_steps=logging_steps,
+        salvar_checkpoints=not args.diagnostico,
         seed=seed,
     )
 
@@ -467,7 +501,17 @@ def main() -> None:
         _imprimir(f"Retomando treinamento a partir do checkpoint: {resume}")
     else:
         _imprimir("Disparando treinamento contrastivo com telemetria cientifica...")
+    # Validacao com os pesos do modelo base, para a curva comecar no passo 0
+    if avaliar_no_inicio and evaluator is not None and not resume:
+        _imprimir("Validacao no passo 0 (modelo base)...")
+        trainer.evaluate()
     trainer.train(resume_from_checkpoint=resume)
+
+    if args.diagnostico:
+        _imprimir("Diagnostico concluido: nenhum modelo gravado.")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return
 
     # 5. Salvamento do Modelo Final (somente o processo da primeira GPU)
     if _processo_principal():

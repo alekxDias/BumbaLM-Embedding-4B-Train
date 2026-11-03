@@ -70,6 +70,29 @@ A rodada completa também pode ir por partes: `preparar`, depois `treinar` e dep
 
 **Se cair:** rode o mesmo comando de novo. A mineração retoma do último bloco de vetores, o treino retoma do último checkpoint e as variantes já concluídas são puladas.
 
+## 2b. Diagnóstico do treino (antes do `completo`)
+
+No smoke, as três variantes ficaram bem abaixo do modelo base. A loss de treino (8 a 11) também ficou acima da de um modelo que chuta ao acaso (ln 128 = 4,85). Antes de gastar ~25 h, rode:
+
+```bash
+bash node2/rodar.sh preparar      # ~2-3 h; a rodada completa reaproveita tudo
+bash node2/rodar.sh diagnostico   # ~1,5 h
+```
+
+O `diagnostico` faz três coisas e não grava nenhum modelo:
+
+1. Avalia o **modelo base no teste completo** (`experiments/diagnostico_h200/base_teste/`). Se o MRR já for ~1,0, a avaliação interna não tem margem para mostrar ganho.
+2. **A_bf16_puro**: treino curto da variante `nenhum` (5.120 tuplas, 40 passos), com warmup e loss a cada passo. A validação roda no passo 0 e a cada 5 passos.
+3. **B_pesos_fp32**: o mesmo treino, com os pesos em fp32 e gradient checkpointing.
+
+Como ler `experiments/diagnostico_h200/resumo.txt`:
+
+| O que aparece | Conclusão |
+|---|---|
+| Loss do passo 1 já acima de ~2 em A e B | O forward do treino não reproduz o modelo base: é bug, não otimização |
+| Loss do passo 1 baixa, depois sobe, e a validação cai em A mas não em B | O bf16 puro estraga o treino: use `pesos_fp32: true` e `gradient_checkpointing: true` |
+| Loss baixa e validação estável ou melhorando em A | Era a falta de warmup do smoke: pode seguir para o `treinar` |
+
 ## 3. Espaço em disco
 
 O `rodar.sh` confere o espaço livre antes de começar e para com erro se faltar.
