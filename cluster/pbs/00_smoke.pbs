@@ -18,7 +18,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | tee -a "$LOG"
 python -c "import torch; print('PyTorch', torch.__version__, '| GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NENHUMA')" | tee -a "$LOG"
 
 # Teste rapido de ponta a ponta: 500 processos, 640 tuplas por variante, pastas separadas
-# (data/smoke_tjma e experiments/smoke_tjma). Confere ambiente, memoria e mede segundos por passo.
+# (data/smoke_tjrs e experiments/smoke_tjrs). Confere ambiente, memoria e mede segundos por passo.
 #   qsub cluster/pbs/00_smoke.pbs
 python -u scripts/run_pipeline.py --all \
     --config_base configs/config_base_smoke.yaml \

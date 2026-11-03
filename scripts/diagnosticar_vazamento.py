@@ -11,6 +11,9 @@ Responde a tres perguntas, com numeros e exemplos:
 
 Nao usa GPU. Roda no no de login em segundos:
     python scripts/diagnosticar_vazamento.py --config_base configs/config_base_smoke.yaml --split test
+
+Comparar arquivos de pares de outros tribunais (amostra de cada um, um relatorio por arquivo):
+    python scripts/diagnosticar_vazamento.py --bruto --amostra 2000 --arquivo /caminho/pares_tjrs.jsonl --arquivo /caminho/pares_tjdf.jsonl
 """
 
 from __future__ import annotations
@@ -53,6 +56,13 @@ def parse_args() -> argparse.Namespace:
         help="Le o arquivo de pares bruto (config_base) em vez dos splits. Sem chunks: secoes 5 e 6 ficam vazias.",
     )
     parser.add_argument("--amostra", type=int, default=3000, help="Com --bruto: processos sorteados do arquivo inteiro.")
+    parser.add_argument(
+        "--arquivo",
+        type=Path,
+        action="append",
+        default=[],
+        help="Com --bruto: arquivo de pares a analisar no lugar dos do config. Pode repetir; gera um relatorio por arquivo.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -62,18 +72,49 @@ _RE_CNJ = re.compile(r"\b\d{7} \d{2} \d{4} \d \d{2} \d{4}\b")
 _CABECALHO = ("sessao do dia", "recorrente", "recorrido", "advogad", "relator", "origem")
 
 
-def _carregar_bruto(cfg: dict, amostra: int, seed: int) -> list:
-    """Le os pares brutos com a mesma limpeza da Etapa 1 e sorteia uma amostra do arquivo inteiro."""
+def _sortear_linhas(caminho: Path, quantidade: int, seed: int) -> tuple[list[bytes], int]:
+    """
+    Amostragem por reservatorio: le o arquivo uma vez, sem fazer parse, e guarda `quantidade`
+    linhas sorteadas de modo uniforme. Arquivos de varios GB levam segundos a poucos minutos.
+    """
+    rng = random.Random(seed)
+    escolhidas: list[bytes] = []
+    total = 0
+    with caminho.open("rb") as f:
+        for linha in f:
+            if not linha.strip():
+                continue
+            total += 1
+            if len(escolhidas) < quantidade:
+                escolhidas.append(linha)
+            else:
+                j = rng.randrange(total)
+                if j < quantidade:
+                    escolhidas[j] = linha
+    return escolhidas, total
+
+
+def _carregar_bruto(cfg: dict, caminho: Path, amostra: int, seed: int) -> list:
+    """
+    Sorteia linhas do arquivo bruto e aplica a mesma limpeza e os mesmos filtros da Etapa 1
+    so nelas. Limpar o arquivo inteiro antes de sortear levava dezenas de minutos.
+    """
+    import tempfile
+
     from src.data.cleaner import carregar_e_filtrar_processos
 
-    dados = cfg.get("dados", {})
-    base = Path(dados.get("diretorio_base_pares", "."))
-    caminhos = [base / a for a in dados.get("arquivos_pares", [])]
-    processos, _ = carregar_e_filtrar_processos(
-        caminho_arquivo=caminhos,
-        mapeamento_colunas=dados.get("colunas", {}),
-    )
-    print(f"Processos validos no arquivo bruto: {len(processos):,}")
+    # Sorteia 30% a mais: parte das linhas cai nos filtros de qualidade.
+    linhas, total = _sortear_linhas(caminho, int(amostra * 1.3), seed)
+    print(f"{caminho.name}: {total:,} linhas no arquivo, {len(linhas):,} sorteadas")
+    with tempfile.TemporaryDirectory() as pasta:
+        # Mesmo nome do original: o cleaner tira o tribunal do nome (pares_tjrs -> TJRS).
+        temporario = Path(pasta) / caminho.name
+        temporario.write_bytes(b"".join(l if l.endswith(b"\n") else l + b"\n" for l in linhas))
+        processos, stats = carregar_e_filtrar_processos(
+            caminho_arquivo=[temporario],
+            mapeamento_colunas=cfg.get("dados", {}).get("colunas", {}),
+        )
+    print(f"  validos apos os filtros: {len(processos):,} | descartes: {stats['motivos_descarte']}")
     if amostra and len(processos) > amostra:
         processos = random.Random(seed).sample(processos, amostra)
     return processos
@@ -113,14 +154,31 @@ def main() -> None:
     if not dir_dados.is_absolute():
         dir_dados = BASE_DIR / dir_dados
 
-    if args.bruto:
-        processos = _carregar_bruto(cfg, args.amostra, args.seed)
-        chunks = []
-        rotulo = f"arquivo bruto, amostra aleatoria de {len(processos):,}"
-    else:
+    if not args.bruto:
         processos = carregar_processos_jsonl(dir_dados / f"{args.split}_processos.jsonl")
         chunks = carregar_chunks_jsonl(dir_dados / f"{args.split}_corpus_chunks.jsonl")
-        rotulo = f"split {args.split}"
+        _analisar(args, processos, chunks, f"split {args.split}", dir_dados / f"diagnostico_vazamento_{args.split}.txt")
+        return
+
+    # Um relatorio por arquivo: assim da para comparar tribunais lado a lado
+    if args.arquivo:
+        arquivos = list(args.arquivo)
+    else:
+        dados = cfg.get("dados", {})
+        base = Path(dados.get("diretorio_base_pares", "."))
+        arquivos = [base / a for a in dados.get("arquivos_pares", [])]
+    for caminho in arquivos:
+        processos = _carregar_bruto(cfg, caminho, args.amostra, args.seed)
+        _analisar(
+            args,
+            processos,
+            [],
+            f"{caminho.name}, amostra aleatoria de {len(processos):,}",
+            dir_dados / f"diagnostico_vazamento_bruto_{caminho.stem}.txt",
+        )
+
+
+def _analisar(args, processos: list, chunks: list, rotulo: str, destino: Path) -> None:
     chunks_por_proc: dict[str, list] = defaultdict(list)
     for ch in chunks:
         chunks_por_proc[ch.processo_id].append(ch)
@@ -214,7 +272,7 @@ def main() -> None:
 
     n = sum(ocorrencias.values())
     p("=" * 72)
-    p(f"DIAGNOSTICO DE VAZAMENTO - {rotulo} ({n} processos) - {dir_dados}")
+    p(f"DIAGNOSTICO DE VAZAMENTO - {rotulo} ({n} processos)")
     p("=" * 72)
     p("\n1. A ementa INTEIRA (identica, apos normalizar) aparece no teor quantas vezes?")
     for k in ("0", "1", "2+"):
@@ -264,8 +322,7 @@ def main() -> None:
     for pid, txt in ex_ementa_bruta:
         p(f"\n[{pid}] \"{txt}\"")
 
-    dir_dados.mkdir(parents=True, exist_ok=True)
-    destino = dir_dados / f"diagnostico_vazamento_{'bruto' if args.bruto else args.split}.txt"
+    destino.parent.mkdir(parents=True, exist_ok=True)
     destino.write_text("\n".join(saida) + "\n", encoding="utf-8")
     print(f"\nSalvo em: {destino}")
 

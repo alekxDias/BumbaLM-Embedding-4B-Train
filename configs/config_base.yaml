@@ -8,15 +8,15 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  # Cluster tapajos: pares do TJMA do TCC
-  diretorio_base_pares: "/projetos/ctcca/nlp/dados_tjma"
-  diretorio_processados: "data/processed_tjma"
+  # Cluster tapajos: amostra de 60 mil acordaos de Camara do TJRS (scripts/amostrar_pares.py)
+  diretorio_base_pares: "/projetos/ctcca/nlp/dados_tjrs"
+  diretorio_processados: "data/processed_tjrs"
 
   # Lista explicita dos arquivos de pares para processamento.
   # Comente ou descomente as linhas para incluir ou excluir tribunais:
   arquivos_pares:
-    # --- TCC: ablacao de negativos so com o TJMA ---
-    - "pares_tjma.jsonl"
+    # --- TCC: ablacao de negativos com o TJRS. O pares_tjma.jsonl (Turmas Recursais) nao sustenta a tarefa ---
+    - "pares_tjrs_amostra60k_camaras.jsonl"
 
     # --- TRIBUNAIS DE JUSTICA ESTADUAIS (rodada multi-tribunal, desativados no TCC) ---
     # - "pares_tjba.jsonl"
@@ -50,6 +50,6 @@ dados:
 saidas:
   diretorio_experimentos: "experiments"
   # Cada variante de negativos grava em experiments/<nome_experimento>/<variante>/
-  nome_experimento: "tcc_tjma_ablacao_negativos"
+  nome_experimento: "tcc_tjrs_ablacao_negativos"
   # Informativo: o cache real vem da variavel HF_HOME, definida em cluster/env.sh
   hf_cache_dir: "/projetos/ctcca/nlp/hf_cache"

@@ -54,7 +54,7 @@ bash cluster/criar_ambiente.sh   # cria o conda em /projetos/ctcca/nlp/conda_env
 bash cluster/baixar_modelo.sh    # baixa o Qwen3-Embedding-4B (~8 GB) para /projetos/ctcca/nlp/hf_cache
 ```
 
-- Os pares são lidos de `/projetos/ctcca/nlp/dados_tjma/pares_tjma.jsonl` (`configs/config_base.yaml`).
+- Os pares são lidos de `/projetos/ctcca/nlp/dados_tjrs/pares_tjrs_amostra60k_camaras.jsonl`, gerado por `scripts/amostrar_pares.py` (`configs/config_base.yaml`).
 - Os jobs rodam **offline** (`HF_HUB_OFFLINE=1` em `cluster/env.sh`), porque nós de computação costumam não ter internet. Por isso o modelo é baixado antes.
 - **O `/home` tem cota pequena.** Por isso o ambiente conda, os caches do pip e do conda e o modelo ficam em `/projetos/ctcca/nlp`. Todos esses caminhos estão em `cluster/caminhos.sh`.
 - O pip da conta aponta para `pypi.ngc.nvidia.com`, inacessível daqui. O script usa `pip --isolated` para ignorar essa configuração.
@@ -69,7 +69,7 @@ Se aparecer `Cota da disco excedida`, veja o uso com `quota -s` e `du -sh ~/.cac
 qsub cluster/pbs/00_smoke.pbs
 ```
 
-O teste roda tudo com 500 processos e 640 tuplas por variante, em pastas separadas (`data/smoke_tjma`, `experiments/smoke_tjma`). Ele confere:
+O teste roda tudo com 500 processos e 640 tuplas por variante, em pastas separadas (`data/smoke_tjrs`, `experiments/smoke_tjrs`). Ele confere:
 
 1. Se o job recebeu a GPU: a primeira linha do log mostra `Tesla V100S`. Se aparecer `NENHUMA`, a fila precisa de um pedido explícito, provavelmente `#PBS -l nodes=1:ppn=15:gpus=1`. Confirme com o orientador.
 2. Se cabe na memória (LoRA + fp16 + gradient checkpointing).
@@ -103,8 +103,8 @@ qsub cluster/pbs/04_avaliar.pbs                 # baseline + 3 variantes no test
 
 | Arquivo | Conteúdo |
 |---|---|
-| `experiments/tcc_tjma_ablacao_negativos/avaliacoes/comparativo_test.txt` | Tabela baseline × nenhum × aleatorios × dificeis, com ganho sobre o baseline |
+| `experiments/tcc_tjrs_ablacao_negativos/avaliacoes/comparativo_test.txt` | Tabela baseline × nenhum × aleatorios × dificeis, com ganho sobre o baseline |
 | `.../avaliacoes/avaliacao_consolidada.json` | Todas as métricas |
 | `.../<variante>/metricas_treino_val.csv` | Curva de validação por passo (para os gráficos) |
 | `.../<variante>/melhor_checkpoint.json` | Checkpoint escolhido pela validação e quantas tuplas treinaram |
-| `data/processed_tjma/relatorio_*.txt` | Contagens exatas de cada etapa (pedido do Revisor 1) |
+| `data/processed_tjrs/relatorio_*.txt` | Contagens exatas de cada etapa (pedido do Revisor 1) |

@@ -10,7 +10,7 @@ import re
 import unicodedata
 from collections import Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from src.data.schema import ProcessoJudicial
 
@@ -196,6 +196,61 @@ def limpar_texto(
     return limpo.strip()
 
 
+# Numero CNJ com ou sem pontuacao (0001234-56.2023.8.21.0001 ou 00012345620238210001),
+# com o "No"/"Nº"/"numero" que costuma vir antes.
+_RE_NUMERO_PROCESSO = re.compile(
+    r"(?i)(?:\bn(?:[º°o]|[uú]mero)\.?\s*:?\s*)?\b\d{7}-?\d{2}\.?\d{4}\.?\d\.?\d{2}\.?\d{4}\b"
+)
+_MARCAS_CITACAO = ("relator", "julgado em", "data de julgamento", "publicacao", "publicado em")
+
+
+def _sem_acento_minusculo(texto: str) -> str:
+    texto = unicodedata.normalize("NFKD", texto.lower())
+    return "".join(c for c in texto if not unicodedata.combining(c))
+
+
+def _inicio_citacao_final(texto: str, max_caracteres: int = 800) -> int:
+    """
+    Posicao do "(" que abre o parentese final, casando os parenteses de tras para frente
+    ("Relator(a)" tem parenteses dentro). -1 se o texto nao termina em parentese.
+    """
+    fim = texto.rstrip(" .;")
+    if not fim.endswith(")"):
+        return -1
+    profundidade = 0
+    for i in range(len(fim) - 1, max(-1, len(fim) - 1 - max_caracteres), -1):
+        if fim[i] == ")":
+            profundidade += 1
+        elif fim[i] == "(":
+            profundidade -= 1
+            if profundidade == 0:
+                return i
+    return -1
+
+
+def limpar_consulta_ementa(ementa: str, contagem: Optional[Counter] = None) -> str:
+    """
+    Tira da ementa o que identifica o processo em vez de descrever a tese.
+
+    1. Citacao do julgado no fim, como no TJRS:
+       "... RECURSO DESPROVIDO.(Apelacao Civel, No 5001..., Primeira Camara Civel, Relator: X, Julgado em: ...)"
+    2. Numeros de processo no formato CNJ, com ou sem pontuacao.
+
+    Sem isso a consulta e o documento compartilham numero, relator e data, e o modelo pode
+    acertar a busca casando identificadores (o que aconteceu no TJMA).
+    """
+    texto = str(ementa or "")
+    inicio = _inicio_citacao_final(texto)
+    if inicio >= 0 and any(m in _sem_acento_minusculo(texto[inicio:]) for m in _MARCAS_CITACAO):
+        texto = texto[:inicio].rstrip()
+        if contagem is not None:
+            contagem["citacao_final_removida"] += 1
+    texto, n_numeros = _RE_NUMERO_PROCESSO.subn("", texto)
+    if n_numeros and contagem is not None:
+        contagem["ementas_com_numero_removido"] += 1
+    return _RE_ESPACOS_MULTIPLOS.sub(" ", texto).strip()
+
+
 def carregar_e_filtrar_processos(
     caminho_arquivo: Path | str | list[Path | str],
     mapeamento_colunas: dict[str, str],
@@ -227,6 +282,7 @@ def carregar_e_filtrar_processos(
 
     processos_validos: list[ProcessoJudicial] = []
     motivos_descarte = Counter()
+    limpeza_consulta = Counter()
     vistos: set[str] = set()
     total_lido = 0
     contagem_tribunal = Counter()
@@ -276,7 +332,7 @@ def carregar_e_filtrar_processos(
                     motivos_descarte["sem_numero_processo"] += 1
                     continue
 
-                ementa = limpar_texto(ementa_raw, remover_html=remover_html)
+                ementa = limpar_consulta_ementa(limpar_texto(ementa_raw, remover_html=remover_html), limpeza_consulta)
                 teor = limpar_texto(teor_raw, remover_html=remover_html)
 
                 if not ementa or not teor:
@@ -327,6 +383,7 @@ def carregar_e_filtrar_processos(
         "validos": len(processos_validos),
         "descartados": sum(motivos_descarte.values()),
         "motivos_descarte": dict(motivos_descarte),
+        "limpeza_consulta": dict(limpeza_consulta),
         "distribuicao_tribunais": dict(Counter(p.tribunal for p in processos_validos)),
     }
 

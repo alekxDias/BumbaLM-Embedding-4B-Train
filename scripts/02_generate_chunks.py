@@ -26,11 +26,12 @@ from typing import Any
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from src.data.chunker import fragmentar_texto_em_chunks, salvar_chunks_jsonl
 from src.data.schema import ChunkProcesso, ProcessoJudicial
-from src.evaluation.leakage_audit import auditar_e_marcar_chunks, gerar_relatorio_auditoria
+from src.evaluation.leakage_audit import auditar_e_marcar_chunks, gerar_relatorio_auditoria, remover_bloco_ementa
 
 
 def carregar_yaml(caminho: Path) -> dict[str, Any]:
@@ -102,13 +103,27 @@ def processar_split(
     overlap: int,
     trecho_minimo_auditoria: int,
     cfg_cobertura: dict | None = None,
+    min_cobertura_bloco: float | None = 0.5,
 ) -> tuple[list[ChunkProcesso], dict]:
     """
     Executa chunking e auditoria de vazamento para uma determinada particao.
+
+    Antes do chunking, recorta do teor o bloco onde a ementa foi reproduzida
+    (min_cobertura_bloco=None desliga). A auditoria depois pega o que sobrar.
     """
     chunks_split: list[ChunkProcesso] = []
+    bloco = {"processos_com_bloco_removido": 0, "blocos_removidos": 0, "palavras_removidas": 0}
 
-    for proc in processos:
+    for proc in tqdm(processos, desc=f"Chunks {nome_split}", unit="proc"):
+        if min_cobertura_bloco is not None:
+            proc.inteiro_teor, n_blocos, n_palavras = remover_bloco_ementa(
+                proc.inteiro_teor, proc.ementa, min_cobertura=min_cobertura_bloco
+            )
+            if n_blocos:
+                bloco["processos_com_bloco_removido"] += 1
+                bloco["blocos_removidos"] += n_blocos
+                bloco["palavras_removidas"] += n_palavras
+
         chunks_proc = fragmentar_texto_em_chunks(
             texto=proc.inteiro_teor,
             processo=proc,
@@ -129,6 +144,7 @@ def processar_split(
         chunks_split.extend(chunks_auditados)
 
     relatorio = gerar_relatorio_auditoria(chunks_split)
+    relatorio["bloco_ementa"] = bloco
     return chunks_split, relatorio
 
 
@@ -153,6 +169,12 @@ def main() -> None:
         "min_palavras_cobertura": int(chunk_cfg.get("min_palavras_cobertura", 12)),
         "ngram_cobertura": int(chunk_cfg.get("ngram_cobertura", 6)),
     }
+    # Recorte do bloco da ementa no teor antes do chunking. False/None no YAML desliga.
+    min_cobertura_bloco = (
+        float(chunk_cfg.get("min_cobertura_bloco_ementa", 0.5))
+        if chunk_cfg.get("remover_bloco_ementa", True)
+        else None
+    )
 
     print("=" * 64)
     print("BumbaLM - Etapa 2: Chunking por Tokens e Auditoria de Ementa")
@@ -164,6 +186,10 @@ def main() -> None:
     print(
         f"Cobertura da Ementa : >= {cfg_cobertura['limiar_cobertura']} e >= {cfg_cobertura['min_palavras_cobertura']} palavras "
         f"(blocos de {cfg_cobertura['ngram_cobertura']})"
+    )
+    print(
+        "Bloco da Ementa     : "
+        + (f"recortado do teor quando cobre >= {min_cobertura_bloco:.0%} da ementa" if min_cobertura_bloco is not None else "mantido")
     )
     print("-" * 64)
 
@@ -196,6 +222,7 @@ def main() -> None:
             overlap=overlap,
             trecho_minimo_auditoria=trecho_minimo,
             cfg_cobertura=cfg_cobertura,
+            min_cobertura_bloco=min_cobertura_bloco,
         )
 
         caminho_saida_chunks = dir_processados / f"{nome}_corpus_chunks.jsonl"
@@ -204,7 +231,12 @@ def main() -> None:
 
         relatorios_splits[nome] = relatorio
 
+        bl = relatorio["bloco_ementa"]
         print(f"  - Total de processos  : {len(processos):,}")
+        print(
+            f"  - Bloco da ementa recortado do teor: {bl['processos_com_bloco_removido']:,} processos "
+            f"({bl['palavras_removidas']:,} palavras)"
+        )
         print(f"  - Total de chunks     : {relatorio['total_chunks']:,}")
         print(f"  - Chunks limpos       : {relatorio['limpos']:,} ({(1 - relatorio['taxa_contaminacao']):.1%})")
         print(f"  - Chunks contaminados : {relatorio['contaminados']:,} ({relatorio['taxa_contaminacao']:.1%})")
@@ -226,6 +258,11 @@ def main() -> None:
 
         for split_nome, rel in relatorios_splits.items():
             f.write(f"--- SPLIT: {split_nome.upper()} ---\n")
+            bl = rel["bloco_ementa"]
+            f.write(
+                f"Bloco da ementa recortado do teor antes do chunking: {bl['processos_com_bloco_removido']:,} de "
+                f"{rel['total_processos']:,} processos | {bl['blocos_removidos']:,} blocos | {bl['palavras_removidas']:,} palavras\n"
+            )
             f.write(f"Total de Chunks       : {rel['total_chunks']:,}\n")
             f.write(f"Chunks Limpos         : {rel['limpos']:,}\n")
             f.write(f"Chunks Contaminados   : {rel['contaminados']:,} ({rel['taxa_contaminacao']:.1%})\n")

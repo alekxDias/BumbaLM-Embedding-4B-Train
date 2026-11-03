@@ -31,10 +31,11 @@ def _hash_estavel(texto: str) -> int:
 def shingles_texto(texto: str, ngram: int = 5) -> set[int]:
     """
     Blocos de `ngram` palavras do texto normalizado, como inteiros de 61 bits.
-    Numeros viram "0": nos casos em massa a ementa muda o valor da condenacao, a data e
-    o numero do processo, e isso nao deve separar acordaos de mesmo texto.
+    Numeros isolados viram "0": nos casos em massa a ementa muda o valor da condenacao, a data
+    e o numero do processo, e isso nao deve separar acordaos de mesmo texto. Digitos dentro
+    de uma palavra (codigos como "lc123") ficam, senao palavras diferentes virariam a mesma.
     """
-    palavras = re.sub(r"\d+", "0", normalizar_texto_auditoria(texto)).split()
+    palavras = re.sub(r"\b\d+\b", "0", normalizar_texto_auditoria(texto)).split()
     if len(palavras) < ngram:
         return {_hash_estavel(" ".join(palavras)) % int(_PRIMO)} if palavras else set()
     return {

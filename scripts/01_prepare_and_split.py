@@ -197,6 +197,9 @@ def main() -> None:
     print(f"Descartados         : {stats_filtro['descartados']:,}")
     for motivo, qtd in sorted(stats_filtro["motivos_descarte"].items()):
         print(f"  - {motivo:25s}: {qtd:,}")
+    print("Limpeza da consulta (ementa):")
+    for motivo, qtd in sorted(stats_filtro.get("limpeza_consulta", {}).items()):
+        print(f"  - {motivo:25s}: {qtd:,}")
 
     print("\nDistribuicao por Tribunal (Validos):")
     for trib, qtd in sorted(stats_filtro["distribuicao_tribunais"].items()):
@@ -262,6 +265,9 @@ def main() -> None:
         f.write(f"Descartados       : {stats_filtro['descartados']:,}\n\n")
         f.write("Descartes por Motivo:\n")
         for k, v in stats_filtro["motivos_descarte"].items():
+            f.write(f"  - {k}: {v:,}\n")
+        f.write("\nLimpeza da consulta (citacao final do julgado e numeros de processo removidos da ementa):\n")
+        for k, v in stats_filtro.get("limpeza_consulta", {}).items():
             f.write(f"  - {k}: {v:,}\n")
         if stats_dup:
             f.write("\nQuase duplicatas (ementas com Jaccard >= "

@@ -5,10 +5,12 @@ Mineracao vetorial acelerada de Hard Negatives em GPU para aprendizado contrasti
 from __future__ import annotations
 
 import gc
+import hashlib
 import inspect
 import json
 import os
 import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -176,7 +178,16 @@ def _caminho_sidecar_embeddings(caminho: Path) -> Path:
     return caminho.with_suffix(".json")
 
 
-def _embeddings_compativeis(caminho: Path, n_chunks: int, model_id: str) -> bool:
+def assinatura_corpus(ids_chunks: list[str]) -> str:
+    """SHA-1 dos chunk_ids em ordem. Muda se o corpus mudar, mesmo com o mesmo numero de chunks."""
+    sha = hashlib.sha1()
+    for cid in ids_chunks:
+        sha.update(cid.encode("utf-8"))
+        sha.update(b"\n")
+    return sha.hexdigest()
+
+
+def _embeddings_compativeis(caminho: Path, n_chunks: int, model_id: str, assinatura: str | None = None) -> bool:
     """Confere se o .npy e o sidecar descrevem este corpus e este modelo."""
     sidecar = _caminho_sidecar_embeddings(caminho)
     if not caminho.is_file() or not sidecar.is_file():
@@ -184,6 +195,9 @@ def _embeddings_compativeis(caminho: Path, n_chunks: int, model_id: str) -> bool
     try:
         meta = json.loads(sidecar.read_text(encoding="utf-8"))
         if int(meta.get("n_chunks", -1)) != n_chunks or meta.get("model_id") != model_id:
+            return False
+        # Cache antigo, sem assinatura, continua valendo; com assinatura diferente, nao.
+        if assinatura and meta.get("assinatura_corpus") not in (None, assinatura):
             return False
         if meta.get("dtype") != "float16":
             return False
@@ -207,6 +221,7 @@ def salvar_embeddings_float16(
     embeddings: np.ndarray,
     model_id: str,
     bloco: int = _BLOCO_GRAVACAO_EMBEDDINGS,
+    assinatura: str | None = None,
 ) -> None:
     """
     Grava a matriz em float16 por blocos.
@@ -247,6 +262,7 @@ def salvar_embeddings_float16(
         "dim": int(embeddings.shape[1]),
         "dtype": "float16",
         "normalizado": True,
+        "assinatura_corpus": assinatura,
     }
     sidecar = _caminho_sidecar_embeddings(destino)
     sidecar_tmp = sidecar.with_name(sidecar.name + ".tmp")
@@ -268,14 +284,21 @@ def obter_embeddings_corpus(
     encode_batch_size: int,
     recomputar: bool,
     dispositivos: list[str] | None = None,
+    ids_chunks: list[str] | None = None,
+    bloco_vetorizacao: int = 20_000,
 ) -> np.ndarray:
     """
     Reutiliza o .npy quando ele bate com o corpus. Senao, vetoriza e grava em float16.
+
+    A vetorizacao e feita em blocos de `bloco_vetorizacao` chunks, cada um gravado em
+    <nome>_partes/ assim que termina. Se o job cair (walltime, falha), a proxima execucao
+    pula os blocos prontos. No fim os blocos viram um .npy so e a pasta e apagada.
     """
     destino = Path(caminho)
     n_chunks = len(textos)
+    assinatura = assinatura_corpus(ids_chunks) if ids_chunks is not None else None
 
-    if not recomputar and _embeddings_compativeis(destino, n_chunks, model_id):
+    if not recomputar and _embeddings_compativeis(destino, n_chunks, model_id, assinatura):
         print(f"Reutilizando embeddings: {destino}")
         print("Vetorizacao do corpus ignorada.")
         return carregar_embeddings_float16(destino)
@@ -287,17 +310,72 @@ def obter_embeddings_corpus(
     else:
         print("Arquivo de embeddings ausente. Vetorizando o corpus...")
 
-    print("Gerando embeddings de todos os chunks do corpus ...")
-    embeddings = encodar_textos_corpus(
-        modelo=modelo,
-        textos=textos,
-        batch_size=encode_batch_size,
-        show_progress=True,
-        dispositivos=dispositivos,
-    )
-    salvar_embeddings_float16(destino, embeddings, model_id=model_id)
-    del embeddings
+    pasta_partes = destino.with_name(destino.stem + "_partes")
+    if recomputar and pasta_partes.is_dir():
+        shutil.rmtree(pasta_partes)
+    pasta_partes.mkdir(parents=True, exist_ok=True)
+
+    bloco = max(1, int(bloco_vetorizacao))
+    n_blocos = (n_chunks + bloco - 1) // bloco
+    meta_base = {"model_id": model_id, "n_chunks_total": n_chunks, "assinatura_corpus": assinatura, "bloco": bloco}
+    partes: list[Path] = []
+    for i in range(n_blocos):
+        ini, fim = i * bloco, min((i + 1) * bloco, n_chunks)
+        parte = pasta_partes / f"parte_{i:05d}.npy"
+        meta_parte = parte.with_suffix(".json")
+        esperado = {**meta_base, "inicio": ini, "fim": fim}
+        partes.append(parte)
+        if parte.is_file() and meta_parte.is_file():
+            try:
+                if json.loads(meta_parte.read_text(encoding="utf-8")) == esperado:
+                    print(f"Bloco {i + 1}/{n_blocos} (chunks {ini:,}-{fim - 1:,}) ja vetorizado. Pulando.")
+                    continue
+            except Exception:
+                pass
+        print(f"Vetorizando bloco {i + 1}/{n_blocos}: chunks {ini:,}-{fim - 1:,} ...")
+        embeddings = encodar_textos_corpus(
+            modelo=modelo,
+            textos=textos[ini:fim],
+            batch_size=encode_batch_size,
+            show_progress=True,
+            dispositivos=dispositivos,
+        )
+        # .npy primeiro, metadado depois: bloco sem metadado e refeito na retomada
+        tmp = parte.with_name(parte.stem + ".tmp.npy")
+        np.save(tmp, np.asarray(embeddings, dtype=np.float16))
+        os.replace(tmp, parte)
+        meta_parte.write_text(json.dumps(esperado), encoding="utf-8")
+        del embeddings
+        gc.collect()
+
+    # Junta os blocos no .npy final, na ordem do corpus
+    primeira = np.load(partes[0], mmap_mode="r")
+    dim = int(primeira.shape[1])
+    del primeira
+    temporario = destino.with_name(destino.name + ".tmp")
+    mapa = np.lib.format.open_memmap(os.fspath(temporario), mode="w+", dtype=np.float16, shape=(n_chunks, dim))
+    for i, parte in enumerate(tqdm(partes, desc="Juntando blocos de embeddings")):
+        dados = np.load(parte, mmap_mode="r")
+        mapa[i * bloco : i * bloco + dados.shape[0]] = dados
+        del dados
+    mapa.flush()
+    mmap = getattr(mapa, "_mmap", None)
+    if mmap is not None:
+        mmap.close()
+    del mapa
     gc.collect()
+    os.replace(temporario, destino)
+    meta = {
+        "model_id": model_id,
+        "n_chunks": n_chunks,
+        "dim": dim,
+        "dtype": "float16",
+        "normalizado": True,
+        "assinatura_corpus": assinatura,
+    }
+    _caminho_sidecar_embeddings(destino).write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    shutil.rmtree(pasta_partes, ignore_errors=True)
+    print(f"Embeddings salvos: {destino} ({n_chunks:,} x {dim}, float16, {n_blocos} blocos)")
     return carregar_embeddings_float16(destino)
 
 
@@ -709,6 +787,7 @@ def minerar_tripletos_contrastivos(
     dispositivos: list[str] | None = None,
     retomar: bool = True,
     excluir_vazados_como_negativos: bool = True,
+    bloco_vetorizacao: int = 20_000,
 ) -> dict[str, Any]:
     """
     Executa a mineracao em lote de tripletos.
@@ -776,6 +855,8 @@ def minerar_tripletos_contrastivos(
         encode_batch_size=encode_batch_size,
         recomputar=recomputar_embeddings,
         dispositivos=dispositivos,
+        ids_chunks=[ch.chunk_id for ch in chunks_corpus],
+        bloco_vetorizacao=bloco_vetorizacao,
     )
 
     # 2b. Retomada: corta linha incompleta e devolve de qual processo seguir.
@@ -799,7 +880,14 @@ def minerar_tripletos_contrastivos(
         "chunks_vazados_ignorados_como_positivo": 0,
         "processos_com_quase_duplicatas": processos_com_gemeos,
         "chunks_vazados_fora_dos_negativos": int(len(indices_vazados)) if indices_vazados is not None else 0,
+        "tuplas_com_negativo_acima_do_positivo": 0,
         "media_margem_tripletos": 0.0,
+    }
+    amostras_scores: dict[str, list] = {
+        "melhor_candidato": [],
+        "candidato_50": [],
+        "melhor_positivo": [],
+        "candidatos_na_faixa": [],
     }
 
     if inicio >= len(processos_validos):
@@ -895,26 +983,32 @@ def minerar_tripletos_contrastivos(
                         if limiar_min <= score_q <= limiar_max:
                             candidatos_validos.append((int(c_idx), float(score_q)))
 
+                    # Similaridade consulta -> positivos, para todos os processos (calibrar a faixa)
+                    pos_indices_array = np.array(pos_indices, dtype=np.int64)
+                    pos_embs_f32 = _coletar_linhas_do_corpus(
+                        pos_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
+                    ).float()
+                    scores_pos_vec = torch.matmul(pos_embs_f32, q_embs_gpu[i_local].float()).cpu().numpy()
+                    limpos = [s for s, i in zip(scores_pos_vec, pos_indices) if not chunks_corpus[i].contem_vazamento_ementa]
+                    validos_q = cands_score_q[cands_score_q > -1e8]
+                    if len(validos_q):
+                        amostras_scores["melhor_candidato"].append(float(validos_q[0]))
+                        amostras_scores["candidato_50"].append(float(validos_q[min(49, len(validos_q) - 1)]))
+                    if limpos:
+                        amostras_scores["melhor_positivo"].append(float(max(limpos)))
+                    amostras_scores["candidatos_na_faixa"].append(len(candidatos_validos))
+
                     if len(candidatos_validos) < n_negativos:
                         stats["chunks_sem_negativos_suficientes"] += len(pos_indices)
                         continue
 
                     cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
                     cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
-                    pos_indices_array = np.array(pos_indices, dtype=np.int64)
-                    cand_embs_gpu = _coletar_linhas_do_corpus(
+                    cand_embs_f32 = _coletar_linhas_do_corpus(
                         cand_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
-                    )
-                    pos_embs_gpu = _coletar_linhas_do_corpus(
-                        pos_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
-                    )
-                    cand_embs_f32 = cand_embs_gpu.float()
-                    pos_embs_f32 = pos_embs_gpu.float()
-                    # (n_pos, n_cand) e (n_pos,): so os vetores deste processo, ja na GPU.
+                    ).float()
+                    # (n_pos, n_cand): so os vetores deste processo, ja na GPU.
                     sims_p_mat = torch.matmul(pos_embs_f32, cand_embs_f32.T).cpu().numpy()
-                    scores_pos_vec = torch.matmul(
-                        pos_embs_f32, q_embs_gpu[i_local].float()
-                    ).cpu().numpy()
 
                     for j_pos, pos_idx in enumerate(pos_indices):
                         ch_positivo = chunks_corpus[pos_idx]
@@ -963,6 +1057,9 @@ def minerar_tripletos_contrastivos(
                         stats["tripletos_salvos"] += 1
                         stats["tripletos_novos"] += 1
                         soma_margens += margem
+                        # Negativo mais parecido com a consulta que o proprio positivo: suspeita de falso negativo
+                        if margem < 0:
+                            stats["tuplas_com_negativo_acima_do_positivo"] += 1
 
                 # Processo so entra no sidecar depois do lote inteiro gravado e com flush.
                 _gravar_progresso(
@@ -980,5 +1077,23 @@ def minerar_tripletos_contrastivos(
 
     if stats["tripletos_novos"] > 0:
         stats["media_margem_tripletos"] = round(soma_margens / stats["tripletos_novos"], 4)
+    stats["distribuicao_scores"] = _resumir_scores(amostras_scores, n_negativos, limiar_min, limiar_max)
 
     return stats
+
+
+def _resumir_scores(amostras: dict[str, list], n_negativos: int, limiar_min: float, limiar_max: float) -> dict[str, Any]:
+    """
+    Percentis das similaridades vistas nesta execucao. Servem para calibrar a faixa
+    [limiar_min, limiar_max]: ela foi escolhida no TJMA e muda de escala com outro tribunal.
+    """
+    resumo: dict[str, Any] = {"faixa": [limiar_min, limiar_max]}
+    for nome in ("melhor_candidato", "candidato_50", "melhor_positivo"):
+        valores = np.asarray(amostras.get(nome, []), dtype=np.float32)
+        if len(valores):
+            resumo[nome] = {f"p{q}": round(float(np.percentile(valores, q)), 4) for q in (5, 25, 50, 75, 95)}
+    na_faixa = np.asarray(amostras.get("candidatos_na_faixa", []))
+    if len(na_faixa):
+        resumo["candidatos_na_faixa_mediana"] = float(np.median(na_faixa))
+        resumo["processos_com_menos_de_n_na_faixa"] = round(float(np.mean(na_faixa < n_negativos)), 4)
+    return resumo

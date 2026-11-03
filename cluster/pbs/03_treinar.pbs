@@ -22,7 +22,7 @@ python -c "import torch; print('PyTorch', torch.__version__, '| GPU:', torch.cud
 #   qsub -v NEGATIVOS=nenhum,LIMITE_TUPLAS=50000 cluster/pbs/03_treinar.pbs
 # Se o job cair por tempo, submeta de novo com os mesmos valores: ele retoma do ultimo checkpoint.
 NEGATIVOS="${NEGATIVOS:-dificeis}"
-EXPERIMENTO="${EXPERIMENTO:-tcc_tjma_ablacao_negativos}"
+EXPERIMENTO="${EXPERIMENTO:-tcc_tjrs_ablacao_negativos}"
 case "$NEGATIVOS" in
     dificeis|aleatorios|nenhum) ;;
     *) echo "NEGATIVOS invalido: '$NEGATIVOS' (use dificeis, aleatorios ou nenhum)" | tee -a "$LOG"; exit 1 ;;

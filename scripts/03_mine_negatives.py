@@ -242,6 +242,7 @@ def main() -> None:
     top_k = mining_cfg.get("top_k_candidatos", 200)
     encode_batch = mining_cfg.get("encode_batch_size", 256)
     query_batch = mining_cfg.get("query_batch_size", 256)
+    bloco_vetorizacao = int(mining_cfg.get("bloco_vetorizacao", 20000))
 
     # Parametros do modelo e instrucao
     modelo_cfg = cfg_train.get("modelo", {})
@@ -306,6 +307,7 @@ def main() -> None:
         recomputar_embeddings=args.recompute_embeddings,
         dispositivos=dispositivos or None,
         retomar=not args.recompute_triplets,
+        bloco_vetorizacao=bloco_vetorizacao,
     )
 
     # 4. Emissao de relatorio de mineracao
@@ -327,6 +329,26 @@ def main() -> None:
         f.write(f"Vazados fora dos negativos       : {stats.get('chunks_vazados_fora_dos_negativos', 0):,}\n")
         f.write(f"Processos com quase duplicatas mascaradas: {stats.get('processos_com_quase_duplicatas', 0):,}\n")
         f.write(f"Margem Media (Pos - Neg) : {stats['media_margem_tripletos']:.4f}\n")
+        f.write(f"Tuplas com negativo acima do positivo (suspeita de falso negativo): "
+                f"{stats.get('tuplas_com_negativo_acima_do_positivo', 0):,}\n")
+        dist = stats.get("distribuicao_scores") or {}
+        if dist:
+            f.write("\nDistribuicao das similaridades com a consulta (cosseno, modelo base):\n")
+            f.write(f"  Faixa usada para os negativos: {dist.get('faixa')}\n")
+            for nome, rotulo in (
+                ("melhor_candidato", "Melhor candidato de outro processo"),
+                ("candidato_50", "50o candidato de outro processo  "),
+                ("melhor_positivo", "Melhor chunk do proprio processo "),
+            ):
+                if nome in dist:
+                    pct = "  ".join(f"{k}={v:.3f}" for k, v in dist[nome].items())
+                    f.write(f"  {rotulo}: {pct}\n")
+            if "candidatos_na_faixa_mediana" in dist:
+                f.write(f"  Candidatos na faixa por consulta (mediana, de no maximo {top_k * 2}): "
+                        f"{dist['candidatos_na_faixa_mediana']:.0f}\n")
+                f.write(f"  Consultas com menos de {n_neg} candidatos na faixa: "
+                        f"{dist['processos_com_menos_de_n_na_faixa']:.1%}\n")
+            f.write("  Leitura: a faixa deve cair abaixo do melhor positivo e pegar boa parte dos candidatos.\n")
         f.write(f"Embeddings do Corpus     : {arq_embeddings}\n")
 
     print("\n" + "=" * 64)
@@ -336,6 +358,13 @@ def main() -> None:
     print(f"  - Processos retomados           : {stats.get('processos_pulados', 0):,}")
     print(f"  - Chunks sem 5 negativos        : {stats['chunks_sem_negativos_suficientes']:,}")
     print(f"  - Margem media (pos - neg max)  : {stats['media_margem_tripletos']:.4f}")
+    print(f"  - Negativo acima do positivo    : {stats.get('tuplas_com_negativo_acima_do_positivo', 0):,} tuplas")
+    dist = stats.get("distribuicao_scores") or {}
+    for nome in ("melhor_candidato", "candidato_50", "melhor_positivo"):
+        if nome in dist:
+            print(f"  - {nome:<30}: {dist[nome]}")
+    if "processos_com_menos_de_n_na_faixa" in dist:
+        print(f"  - Consultas sem {n_neg} na faixa    : {dist['processos_com_menos_de_n_na_faixa']:.1%}")
     print(f"Arquivo de saida salvo em         : {arq_saida}")
     print(f"Embeddings do corpus              : {arq_embeddings}")
     print(f"Relatorio salvo em                : {relatorio_txt}")

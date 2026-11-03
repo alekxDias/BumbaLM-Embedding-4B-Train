@@ -4,6 +4,7 @@ Auditoria de vazamento de ementa no inteiro teor (Problema do Chunk 0).
 
 from __future__ import annotations
 
+import difflib
 import re
 import unicodedata
 from collections import Counter
@@ -145,6 +146,78 @@ def _classificar(
         return "cobertura", cobertura
 
     return None, cobertura
+
+
+def remover_bloco_ementa(
+    teor: str,
+    ementa: str,
+    min_cobertura: float = 0.5,
+    max_lacuna: int = 8,
+    max_blocos: int = 3,
+) -> tuple[str, int, int]:
+    """
+    Recorta do inteiro teor o bloco onde a ementa foi reproduzida (no TJRS, em geral no fim
+    ou no meio do acordao), em vez de descartar o chunk inteiro e perder o voto que esta junto.
+
+    A comparacao e palavra a palavra sobre o texto normalizado, entao tolera diferencas de
+    acento, pontuacao e quebra de linha. Trechos casados separados por ate `max_lacuna`
+    palavras contam como o mesmo bloco. So recorta quando o bloco cobre pelo menos
+    `min_cobertura` das palavras da ementa: frases da ementa espalhadas pelo voto ficam.
+    Repete ate `max_blocos` vezes, para o caso de a ementa aparecer mais de uma vez.
+
+    Returns:
+        (teor sem o bloco, blocos removidos, palavras removidas)
+    """
+    palavras_ementa = remover_rotulos_iniciais(normalizar_texto_auditoria(ementa)).split()
+    if len(palavras_ementa) < 8:
+        return teor, 0, 0
+
+    blocos_removidos = 0
+    palavras_removidas = 0
+    for _ in range(max_blocos):
+        # Cada palavra normalizada aponta para o token original, para recortar o texto bruto
+        tokens = list(re.finditer(r"\S+", teor))
+        palavras_teor: list[str] = []
+        token_da_palavra: list[int] = []
+        for indice, token in enumerate(tokens):
+            for palavra in normalizar_texto_auditoria(token.group()).split():
+                palavras_teor.append(palavra)
+                token_da_palavra.append(indice)
+        if not palavras_teor:
+            break
+
+        # autojunk=False: com o padrao, palavras frequentes ("de", "que") quebram os blocos
+        casados = [
+            b for b in difflib.SequenceMatcher(None, palavras_ementa, palavras_teor, autojunk=False).get_matching_blocks()
+            if b.size >= 3
+        ]
+        if not casados:
+            break
+        casados.sort(key=lambda b: b.b)
+
+        melhor: tuple[int, int, int] = (0, 0, 0)  # (palavras da ementa cobertas, inicio, fim) no teor
+        inicio, fim, cobertas = casados[0].b, casados[0].b + casados[0].size, casados[0].size
+        for bloco in casados[1:]:
+            if bloco.b - fim <= max_lacuna:
+                fim, cobertas = bloco.b + bloco.size, cobertas + bloco.size
+            else:
+                melhor = max(melhor, (cobertas, inicio, fim))
+                inicio, fim, cobertas = bloco.b, bloco.b + bloco.size, bloco.size
+        melhor = max(melhor, (cobertas, inicio, fim))
+
+        cobertas, inicio, fim = melhor
+        if cobertas / len(palavras_ementa) < min_cobertura:
+            break
+        # Leva junto o rotulo "EMENTA" logo antes do bloco
+        if inicio > 0 and palavras_teor[inicio - 1] == "ementa":
+            inicio -= 1
+        corte_ini = tokens[token_da_palavra[inicio]].start()
+        corte_fim = tokens[token_da_palavra[fim - 1]].end()
+        palavras_removidas += fim - inicio
+        blocos_removidos += 1
+        teor = (teor[:corte_ini].rstrip() + "\n\n" + teor[corte_fim:].lstrip()).strip()
+
+    return teor, blocos_removidos, palavras_removidas
 
 
 def auditar_e_marcar_chunks(
