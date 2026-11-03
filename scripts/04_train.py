@@ -24,7 +24,9 @@ Uso:
 from __future__ import annotations
 
 import os
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# expandable_segments nao e mais ligado aqui: no driver 510 da V100 ele quebra a alocacao
+# ("CUDA driver error: invalid argument"). Na H200 da para ligar exportando
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True antes de rodar.
 
 import argparse
 import json

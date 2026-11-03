@@ -15,8 +15,9 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
-# Reduz a fragmentacao da memoria da GPU (sugestao da propria mensagem de OOM do PyTorch)
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Sem expandable_segments: no driver 510 (CUDA 11.6) da V100 ele falha com
+# "CUDA driver error: invalid argument" assim que a memoria precisa crescer.
+unset PYTORCH_CUDA_ALLOC_CONF
 # Threads de CPU iguais aos nucleos pedidos no PBS (ppn)
 export OMP_NUM_THREADS="${PBS_NP:-8}"
 
