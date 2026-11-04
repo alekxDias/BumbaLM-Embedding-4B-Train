@@ -5,6 +5,7 @@
 #   bash node2/rodar.sh amostra     # sorteia os 60 mil acordaos de Camara do pares_tjrs.jsonl
 #   bash node2/rodar.sh smoke       # ponta a ponta com 500 acordaos e 640 tuplas por variante
 #   bash node2/rodar.sh preparar    # split, chunk, mineracao dos dificeis e sorteio dos aleatorios
+#   bash node2/rodar.sh minerar     # so mineracao e aleatorios (retoma o preparar interrompido na mineracao)
 #   bash node2/rodar.sh diagnostico # depois do preparar: base no teste completo + 2 treinos curtos (~1,5 h)
 #   bash node2/rodar.sh treinar     # as tres variantes, uma de cada vez
 #   bash node2/rodar.sh avaliar     # teste completo das variantes e do modelo base
@@ -182,6 +183,14 @@ case "$MODO" in
         exigir_amostra
         exigir_espaco 50
         pipeline --steps split,chunk,mine,random --gpus 0,1
+        ;;
+    minerar)
+        if [ ! -f data/processed_tjrs/train_corpus_chunks.jsonl ]; then
+            echo "ERRO: faltam os chunks. Rode 'bash node2/rodar.sh preparar'." | tee -a "$LOG"
+            exit 1
+        fi
+        exigir_espaco 40
+        pipeline --steps mine,random --gpus 0,1
         ;;
     diagnostico)
         if [ ! -f data/processed_tjrs/train_tuplas_aleatorias.jsonl ]; then
