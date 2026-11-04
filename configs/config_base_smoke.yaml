@@ -9,7 +9,7 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  # node2: amostra de 60 mil acordaos de Camara do TJRS, gerada por node2/rodar.sh amostra
+  # node2: 500 acordaos da amostra de 100 mil de Camara do TJRS, gerada por node2/rodar.sh amostra
   diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
   diretorio_processados: "data/smoke_tjrs"
 
@@ -17,7 +17,7 @@ dados:
   # Comente ou descomente as linhas para incluir ou excluir tribunais:
   arquivos_pares:
     # --- TCC: ablacao de negativos com o TJRS. O pares_tjma.jsonl (Turmas Recursais) nao sustenta a tarefa ---
-    - "pares_tjrs_amostra60k_camaras.jsonl"
+    - "pares_tjrs_amostra100k_camaras.jsonl"
 
     # --- TRIBUNAIS DE JUSTICA ESTADUAIS (rodada multi-tribunal, desativados no TCC) ---
     # - "pares_tjba.jsonl"

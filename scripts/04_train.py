@@ -117,6 +117,31 @@ def _imprimir(mensagem: str) -> None:
         print(mensagem)
 
 
+def _conferir_validacao_inicial(metricas: dict[str, float], minimo: float, dispositivo: str) -> None:
+    """
+    Para o treino quando o modelo ja comeca quebrado. O modelo base acerta bem a validacao
+    (MRR@10 ~0,5 ou mais); um MRR perto de zero no passo 0 indica erro na montagem do modelo,
+    e treinar por horas a partir dele invalidaria a comparacao das variantes.
+    A decisao e do rank 0 e vale para todos, para nenhuma GPU ficar presa esperando a outra.
+    """
+    mrr = next((v for k, v in metricas.items() if k.endswith("mrr@10")), None)
+    abortar = mrr is not None and mrr < minimo
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        sinal = torch.tensor([1.0 if abortar else 0.0], device=dispositivo)
+        torch.distributed.broadcast(sinal, src=0)
+        abortar = bool(sinal.item())
+    if mrr is not None:
+        _imprimir(f"MRR@10 da validacao no passo 0: {mrr:.4f} (minimo exigido: {minimo})")
+    if abortar:
+        _imprimir(
+            "ERRO: o modelo ja comeca muito abaixo do base na validacao. Treino interrompido. "
+            "Rode 'bash node2/rodar.sh testar_modelo' para comparar as formas de carregar o modelo."
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        sys.exit(2)
+
+
 def _resolver_gpus(args: argparse.Namespace, cfg_train: dict[str, Any]) -> str:
     if args.gpus is not None:
         return args.gpus.strip()
@@ -504,7 +529,9 @@ def main() -> None:
     # Validacao com os pesos do modelo base, para a curva comecar no passo 0
     if avaliar_no_inicio and evaluator is not None and not resume:
         _imprimir("Validacao no passo 0 (modelo base)...")
-        trainer.evaluate()
+        metricas_passo0 = trainer.evaluate()
+        minimo_mrr = float(cfg_train.get("avaliacao", {}).get("mrr_minimo_passo0", 0.2))
+        _conferir_validacao_inicial(metricas_passo0 or {}, minimo_mrr, dispositivo)
     trainer.train(resume_from_checkpoint=resume)
 
     if args.diagnostico:
@@ -519,6 +546,10 @@ def main() -> None:
         # Sem LoRA, load_best_model_at_end ja trouxe o melhor. Com LoRA, este e o ultimo passo.
         nome_final = "modelo_final" if usar_lora else "best_model_4b"
         best_model_path = dir_saida / nome_final
+        # Pesos em fp32 so servem ao otimizador. O modelo final vai em bf16 (~8 GB em vez de ~16 GB),
+        # a mesma precisao em que a Etapa 5 avalia.
+        if pesos_fp32 and not usar_lora and precisao_mista == "bf16":
+            modelo_salvar.to(torch.bfloat16)
         modelo_salvar.save(str(best_model_path))
 
         melhor_ckpt = trainer.state.best_model_checkpoint

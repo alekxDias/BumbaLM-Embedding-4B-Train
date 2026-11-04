@@ -37,19 +37,20 @@ treinamento:
 
   # "auto": bf16 na H200.
   precisao: "auto"
-  gradient_checkpointing: false # Desligado: a H200 tem memoria de sobra e o passo fica mais rapido
-  # false: pesos, gradientes e Adam em bf16 ("bf16 puro", ~32 GB). true: pesos em fp32 e bf16 so na
-  # autocast (~64 GB, pede gradient_checkpointing: true). Decidir pelo node2/rodar.sh diagnostico.
-  pesos_fp32: false
+  # Pesos em fp32 e bf16 so na autocast. No diagnostico de 03/11/2026 o bf16 puro teve grad_norm
+  # 3 a 5x maior e validacao pior (MRR 0,774 x 0,806): atualizacoes de ~2e-5 somem no arredondamento
+  # do bf16. Com fp32 o passo fica ~60% mais lento e o gradient checkpointing segura a memoria (~87 GB).
+  gradient_checkpointing: true
+  pesos_fp32: true
 
   # Loss e grad_norm a cada N passos. A validacao no passo 0 mede o modelo base na mesma curva.
   logging_steps: 10
   avaliar_no_inicio: true
 
   # Sorteia N tuplas (mesma semente nas tres variantes). null usa todas.
-  # A amostra de 60 mil acordaos gera ~500 mil tuplas (~10 chunks por acordao): 30 a 40 h por variante.
-  # Com 100 mil, a variante "dificeis" leva ~8 h e a "nenhum" ~3 h nas duas H200.
-  limite_tuplas: 100000
+  # A mineracao rende ~2,4 tuplas por acordao de treino (o teto relativo descarta ~75% dos chunks):
+  # 60 mil acordaos deram 116.419 tuplas; 100 mil devem dar ~195 mil (o artigo do TJMA usou 212.633).
+  limite_tuplas: null
 
   # Otimizacao de alimentacao CPU -> GPU
   dataloader_num_workers: 4
@@ -62,10 +63,10 @@ treinamento:
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
 
-  # Frequencia de checkpoints e avaliacao. 100 mil tuplas / 128 por passo = ~780 passos.
+  # Frequencia de checkpoints e avaliacao. ~195 mil tuplas / 128 por passo = ~1.520 passos.
   eval_steps: 200
   save_steps: 200
-  # 1: fica o ultimo e o melhor. Cada checkpoint do full fine-tuning tem ~24 GB.
+  # 1: fica o ultimo e o melhor. Com pesos em fp32, cada checkpoint (pesos + Adam) tem ~48 GB.
   save_total_limit: 1
   metric_for_best_model: "val_cosine_ndcg@10"
   greater_is_better: true
@@ -80,6 +81,9 @@ avaliacao:
   # No TJRS sao ~11 chunks por processo: 300 processos = ~3.400 chunks.
   # A Etapa 5 sempre usa o split de teste completo.
   max_processos_val: 300
+  # O treino para se a validacao do passo 0 ficar abaixo disto: o modelo base passa de 0,5.
+  # Um valor perto de zero indica modelo montado errado (foi o caso do diagnostico de 03/11/2026).
+  mrr_minimo_passo0: 0.2
   # Precisao dos pesos na Etapa 5.
   precisao: "auto"
   metricas:
