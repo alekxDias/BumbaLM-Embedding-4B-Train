@@ -8,7 +8,7 @@ Branch `tcc/ablacao-negativos-h200`. Mesmo pipeline da `tcc/ablacao-negativos-tj
 | Lote | 64, GradCache de 4, gradient checkpointing | 64 por placa (128 por passo), GradCache de 16, gradient checkpointing |
 | LR | 1e-4 (LoRA) | 2e-5 (do artigo) |
 | Mineração | lote de 32 | lote de 256, nas duas placas |
-| Tuplas por variante | todas | todas (~195 mil, de 100 mil acórdãos de Câmara do TJRS) |
+| Tuplas por variante | todas | todas (~195 mil, de 100 mil acórdãos do TJRS) |
 
 | Variante | Negativos no treino |
 |---|---|
@@ -59,7 +59,7 @@ cd ~/bumbalm/BumbaLM-h200
 
 bash node2/rodar.sh checar        # GPUs, modelo no cache, amostra e disco
 bash node2/rodar.sh testar_modelo # ~5 min: confere que o treino carrega o modelo igual ao Hub
-bash node2/rodar.sh amostra       # uma vez: pares_tjrs_amostra100k_camaras.jsonl em ~/bumbalm/Pares_Tribunais
+bash node2/rodar.sh amostra       # uma vez: pares_tjrs_amostra100k.jsonl em ~/bumbalm/Pares_Tribunais
 bash node2/rodar.sh preparar      # split, chunks, vetores do corpus, mineração e aleatórios
 bash node2/rodar.sh diagnostico   # ~1,5 h: base no teste + treino curto na configuração final
 bash node2/rodar.sh treinar       # as três variantes
@@ -71,6 +71,10 @@ Para sair do tmux sem parar nada: `Ctrl+b` e depois `d`. O log fica em `logs/nod
 A rodada completa também pode ir por partes: `preparar`, depois `treinar` e depois `avaliar`. Para uma variante só: `VARIANTES=dificeis bash node2/rodar.sh treinar`.
 
 **Se cair:** rode o mesmo comando de novo. A mineração retoma do último bloco de vetores, o treino retoma do último checkpoint e as variantes já concluídas são puladas.
+
+## 2a. Por que a amostra não filtra por órgão
+
+A rodada de 60 mil usou `--somente_camaras`, que classifica pelas palavras dos primeiros 4.000 caracteres do teor ("turma recursal", "recurso inominado", "juizado especial"). Numa conferência de 30 mil linhas do `pares_tjrs.jsonl`, os acórdãos marcados como Turma Recursal eram, nos exemplos, de Câmaras (3ª Câmara Criminal, 24ª Câmara Cível) que só citavam essas palavras. O grupo tinha teor completo (mediana de 13 mil caracteres) e menos ementa copiada no teor (0,23 contra 0,36). O filtro tirava ~29% dos acórdãos e enviesava os temas. A amostra de 100 mil é aleatória sobre o arquivo todo, e os riscos de atalho são tratados direto no texto: recorte do bloco da ementa, exclusão de chunks com vazamento, quase duplicatas no mesmo split e teto relativo na mineração.
 
 ## 2b. Diagnóstico do treino (antes do `treinar`)
 

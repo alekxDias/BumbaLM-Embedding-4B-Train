@@ -3,7 +3,7 @@
 #
 #   bash node2/rodar.sh checar      # GPUs, modelo no cache, amostra e espaco em disco
 #   bash node2/rodar.sh testar_modelo # compara as formas de carregar o modelo (~5 min, uma GPU)
-#   bash node2/rodar.sh amostra     # sorteia os 100 mil acordaos de Camara do pares_tjrs.jsonl
+#   bash node2/rodar.sh amostra     # sorteia 100 mil acordaos do pares_tjrs.jsonl (sem filtro por orgao)
 #   bash node2/rodar.sh smoke       # ponta a ponta com 500 acordaos e 640 tuplas por variante
 #   bash node2/rodar.sh preparar    # split, chunk, mineracao dos dificeis e sorteio dos aleatorios
 #   bash node2/rodar.sh minerar     # so mineracao e aleatorios (retoma o preparar interrompido na mineracao)
@@ -26,7 +26,7 @@ VARIANTES="${VARIANTES:-nenhum,aleatorios,dificeis}"
 LIMPAR_CHECKPOINTS="${LIMPAR_CHECKPOINTS:-1}"
 # Precisa bater com dados.arquivos_pares de configs/config_base.yaml
 AMOSTRA_N=100000
-AMOSTRA="$PARES_DIR/pares_tjrs_amostra$((AMOSTRA_N / 1000))k_camaras.jsonl"
+AMOSTRA="$PARES_DIR/pares_tjrs_amostra$((AMOSTRA_N / 1000))k.jsonl"
 # Precisa bater com dados.diretorio_processados de configs/config_base.yaml
 DADOS="data/processed_tjrs100k"
 
@@ -182,7 +182,7 @@ case "$MODO" in
             exit 0
         fi
         exigir_espaco 5
-        python -u scripts/amostrar_pares.py "$PARES_DIR/pares_tjrs.jsonl" --n "$AMOSTRA_N" --somente_camaras 2>&1 | tee -a "$LOG"
+        python -u scripts/amostrar_pares.py "$PARES_DIR/pares_tjrs.jsonl" --n "$AMOSTRA_N" 2>&1 | tee -a "$LOG"
         ;;
     smoke)
         exigir_amostra

@@ -8,7 +8,10 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  # node2: amostra de 100 mil acordaos de Camara do TJRS, gerada por node2/rodar.sh amostra.
+  # node2: amostra aleatoria de 100 mil acordaos do TJRS, gerada por node2/rodar.sh amostra.
+  # Sem filtro por orgao: a regra por palavras do --somente_camaras tirava ~29% dos acordaos,
+  # quase todos de Camara que so citavam "juizado especial" ou "turma recursal". Os riscos de atalho
+  # sao tratados no texto: recorte da ementa, chunks com vazamento, quase duplicatas e teto relativo.
   # A rodada de 60 mil (03/11/2026) ficou em data/processed_tjrs.
   diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
   diretorio_processados: "data/processed_tjrs100k"
@@ -17,7 +20,7 @@ dados:
   # Comente ou descomente as linhas para incluir ou excluir tribunais:
   arquivos_pares:
     # --- TCC: ablacao de negativos com o TJRS. O pares_tjma.jsonl (Turmas Recursais) nao sustenta a tarefa ---
-    - "pares_tjrs_amostra100k_camaras.jsonl"
+    - "pares_tjrs_amostra100k.jsonl"
 
     # --- TRIBUNAIS DE JUSTICA ESTADUAIS (rodada multi-tribunal, desativados no TCC) ---
     # - "pares_tjba.jsonl"
