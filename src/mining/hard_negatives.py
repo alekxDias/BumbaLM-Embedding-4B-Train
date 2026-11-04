@@ -124,6 +124,22 @@ def _encodar_nas_duas_gpus(
     O pool e fechado antes de voltar, para liberar a copia extra do modelo.
     """
     print(f"Vetorizando o corpus em {len(dispositivos)} GPUs: {', '.join(dispositivos)}")
+    # O pool do Sentence Transformers move o modelo para a CPU e o deixa la. Sem devolver,
+    # as ementas da busca eram vetorizadas na CPU: 7 s por processo com as GPUs a 0%.
+    dispositivo_original = modelo.device
+    try:
+        return _encodar_com_pool(modelo, textos, batch_size, show_progress, dispositivos)
+    finally:
+        modelo.to(dispositivo_original)
+
+
+def _encodar_com_pool(
+    modelo: SentenceTransformer,
+    textos: list[str],
+    batch_size: int,
+    show_progress: bool,
+    dispositivos: list[str],
+) -> np.ndarray:
     # Nao e DDP: cada processo vetoriza um pedaco e a biblioteca junta na ordem original.
     if _encode_aceita_duas_gpus(modelo):
         embeddings = modelo.encode(
@@ -451,7 +467,7 @@ def _topk_numa_fatia(
     dtype_tensor: torch.dtype,
     indices_vazados: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # q_embs chega pela CPU: copia direta entre as placas travava o node2 (GPU a 0%).
+    # As ementas nascem numa placa so. A copia para a fatia e pequena: 256 vetores.
     q_local = q_embs.to(device=matriz.device, dtype=dtype_tensor)
     sims = torch.matmul(q_local, matriz.T)
     _mascarar_mesmo_processo(sims, offset, matriz.shape[0], batch_procs, indices_por_processo, indices_vazados)
@@ -981,7 +997,7 @@ def minerar_tripletos_contrastivos(
 
                 t_busca = time.perf_counter()
                 # Processamento dos candidatos na CPU: poucas linhas por processo (~10 positivos x
-                # ~400 candidatos). Na GPU eram copias pequenas entre as placas, a 7 s por processo.
+                # ~400 candidatos), lidas da matriz do .npy.
                 for i_local, proc in enumerate(batch_procs):
                     stats["processos_avaliados"] += 1
                     pos_indices = indices_por_processo[proc.id_global]
