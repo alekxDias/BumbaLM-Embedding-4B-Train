@@ -8,15 +8,19 @@ projeto:
 
 # Caminhos dos Dados
 dados:
-  # Cluster tapajos: amostra de 60 mil acordaos de Camara do TJRS (scripts/amostrar_pares.py)
-  diretorio_base_pares: "/projetos/ctcca/nlp/dados_tjrs"
-  diretorio_processados: "data/processed_tjrs"
+  # node2: amostra aleatoria de 100 mil acordaos do TJRS, gerada por node2/rodar.sh amostra.
+  # Sem filtro por orgao: a regra por palavras do --somente_camaras tirava ~29% dos acordaos,
+  # quase todos de Camara que so citavam "juizado especial" ou "turma recursal". Os riscos de atalho
+  # sao tratados no texto: recorte da ementa, chunks com vazamento, quase duplicatas e teto relativo.
+  # A rodada de 60 mil (03/11/2026) ficou em data/processed_tjrs.
+  diretorio_base_pares: "/home/fabio.lobato/bumbalm/Pares_Tribunais"
+  diretorio_processados: "data/processed_tjrs100k"
 
   # Lista explicita dos arquivos de pares para processamento.
   # Comente ou descomente as linhas para incluir ou excluir tribunais:
   arquivos_pares:
     # --- TCC: ablacao de negativos com o TJRS. O pares_tjma.jsonl (Turmas Recursais) nao sustenta a tarefa ---
-    - "pares_tjrs_amostra60k_camaras.jsonl"
+    - "pares_tjrs_amostra100k.jsonl"
 
     # --- TRIBUNAIS DE JUSTICA ESTADUAIS (rodada multi-tribunal, desativados no TCC) ---
     # - "pares_tjba.jsonl"
@@ -50,6 +54,6 @@ dados:
 saidas:
   diretorio_experimentos: "experiments"
   # Cada variante de negativos grava em experiments/<nome_experimento>/<variante>/
-  nome_experimento: "tcc_tjrs_ablacao_negativos"
-  # Informativo: o cache real vem da variavel HF_HOME, definida em cluster/env.sh
-  hf_cache_dir: "/projetos/ctcca/nlp/hf_cache"
+  nome_experimento: "tcc_tjrs100k_ablacao_negativos_h200"
+  # Informativo: o cache real vem da variavel HF_HOME, definida em node2/env.sh
+  hf_cache_dir: "/home/fabio.lobato/bumbalm/hf_cache"

@@ -10,7 +10,7 @@ import os
 from typing import Any, Optional
 
 import torch
-from sentence_transformers import SentenceTransformer, models
+from sentence_transformers import SentenceTransformer
 
 from src.hardware import dtype_para_dispositivo
 
@@ -59,9 +59,10 @@ def construir_modelo_embedding(
     device: Optional[str] = None,
     precisao: str = "auto",
     lora: Optional[dict[str, Any]] = None,
+    pesos_fp32: bool = False,
 ) -> SentenceTransformer:
     """
-    Instancia e configura o pipeline SentenceTransformer:
+    Carrega o pipeline SentenceTransformer do Hub e o prepara para o fine-tuning:
     1. Camada Transformer: Base Qwen3 com precisao conforme a GPU e atencao acelerada.
     2. Camada Pooling: Modo 'lasttoken'.
     3. Camada Normalize: Projecao na esfera unitaria L2.
@@ -75,6 +76,8 @@ def construir_modelo_embedding(
         device: Dispositivo de execucao ('cuda', 'cuda:0', 'cuda:1' ou 'cpu').
         precisao: "auto", "bf16", "fp16" ou "fp32". "auto" usa fp16 na V100 e bf16 da Ampere em diante.
         lora: Configuracao do LoRA ({"ativo": True, "r": 16, ...}). None ou ativo=False faz Full Fine-Tuning.
+        pesos_fp32: No full fine-tuning, carrega os pesos em fp32 e deixa o bf16 so na autocast do Trainer.
+            Sem isso, na H200 pesos, gradientes e Adam ficam todos em bf16 (bf16 "puro").
 
     Returns:
         Instancia de SentenceTransformer pronta para fine-tuning.
@@ -90,6 +93,9 @@ def construir_modelo_embedding(
     dtype_modelo = dtype_para_dispositivo(device, precisao)
     # Full fine-tuning em fp16 precisa dos pesos mestres em fp32. So o LoRA mantem a base em fp16.
     if dtype_modelo == torch.float16 and not usar_lora:
+        dtype_modelo = torch.float32
+    # Em bf16 puro, atualizacoes de ~2e-5 somem no arredondamento de pesos da ordem de 1e-2
+    if pesos_fp32 and not usar_lora and em_cuda:
         dtype_modelo = torch.float32
 
     rank = os.environ.get("RANK", "0")
@@ -107,17 +113,23 @@ def construir_modelo_embedding(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # 1. Camada Transformer
-    word_embedding_model = models.Transformer(
-        model_name_or_path=model_id,
-        max_seq_length=max_seq_length,
-        tokenizer_args={"padding_side": "left"},
-        model_args={
+    # 1. Pipeline completo do Hub (Transformer, Pooling last-token e Normalize), do mesmo jeito que a
+    # mineracao e a Etapa 5 carregam o modelo base. A montagem manual dos modulos
+    # (models.Transformer + Pooling + Normalize) dava um modelo diferente no sentence-transformers do
+    # node2: validacao no passo 0 com MRR 0,04 e loss 16 no primeiro passo, contra MRR 0,54 do base.
+    # Confira com: bash node2/rodar.sh testar_modelo
+    modelo = SentenceTransformer(
+        model_id,
+        device=device,
+        trust_remote_code=True,
+        model_kwargs={
             "attn_implementation": attn_implementation if em_cuda else "eager",
             "torch_dtype": dtype_modelo,
-            "trust_remote_code": True,
         },
+        tokenizer_kwargs={"padding_side": "left"},
     )
+    modelo.max_seq_length = max_seq_length
+    word_embedding_model = modelo[0]
     word_embedding_model.auto_model.config.use_cache = False
 
     # 2. Ativacao ou desativacao do Gradient Checkpointing
@@ -135,20 +147,10 @@ def construir_modelo_embedding(
     for param in word_embedding_model.auto_model.parameters():
         param.requires_grad = True
 
-    # 4. Camada de Pooling (Last Token)
-    pooling_model = models.Pooling(
-        word_embedding_model.get_word_embedding_dimension(),
-        pooling_mode="lasttoken",
-    )
-
-    # 5. Camada de Normalizacao L2
-    normalize_model = models.Normalize()
-
-    # 6. Montagem do Pipeline Modular
-    modelo = SentenceTransformer(
-        modules=[word_embedding_model, pooling_model, normalize_model],
-        device=device,
-    )
+    if rank == "0":
+        tokenizador = getattr(modelo, "tokenizer", None)
+        print(f"  - Padding do tokenizer : {getattr(tokenizador, 'padding_side', '?')}")
+        print(f"  - Modulos              : {' -> '.join(type(m).__name__ for m in modelo)}")
 
     if usar_lora:
         _aplicar_lora(modelo, lora, rank)

@@ -128,6 +128,8 @@ def configurar_treinador(
     greater_is_better: bool = True,
     save_total_limit: int = 2,
     carregar_melhor_no_fim: bool = True,
+    logging_steps: int = 10,
+    salvar_checkpoints: bool = True,
     seed: int = 42,
 ) -> tuple[SentenceTransformerTrainer, ScientificMetricsCallback]:
     """
@@ -136,6 +138,7 @@ def configurar_treinador(
     precisao_mista: "bf16" (A100/H200), "fp16" (V100) ou "no".
     carregar_melhor_no_fim: com LoRA fica False. O melhor checkpoint e lido depois pelo caminho
     gravado em trainer.state.best_model_checkpoint.
+    salvar_checkpoints: False nao grava checkpoint nenhum (diagnostico: cada um do full fine-tuning tem 24 GB).
     """
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -165,7 +168,8 @@ def configurar_treinador(
     lote_passo = batch_size * gradient_accumulation_steps * num_processos
     passos_por_epoca = max(1, len(train_dataset) // lote_passo)
     total_steps = passos_por_epoca * num_epochs
-    warmup_steps = int(total_steps * warmup_ratio)
+    # Pelo menos 1 passo de warmup: no smoke, int(5 * 0.05) dava 0 e o 1o passo ja usava o LR cheio
+    warmup_steps = max(1, int(total_steps * warmup_ratio)) if warmup_ratio > 0 else 0
 
     tem_avaliador = evaluator is not None
 
@@ -206,13 +210,15 @@ def configurar_treinador(
         fp16=precisao_mista == "fp16" and torch.cuda.is_available(),
         eval_strategy="steps" if tem_avaliador else "no",
         eval_steps=eval_steps_efetivo if tem_avaliador else None,
-        save_strategy="steps",
+        save_strategy="steps" if salvar_checkpoints else "no",
         save_steps=save_steps_efetivo,
         save_total_limit=save_total_limit,
-        load_best_model_at_end=tem_avaliador and carregar_melhor_no_fim,
+        load_best_model_at_end=tem_avaliador and carregar_melhor_no_fim and salvar_checkpoints,
         metric_for_best_model=metric_for_best_model if tem_avaliador else None,
         greater_is_better=greater_is_better if tem_avaliador else None,
-        logging_steps=10,
+        logging_steps=logging_steps,
+        # Loss e grad_norm do 1o passo, ainda calculados com os pesos do modelo base
+        logging_first_step=True,
         report_to="none",
         dataloader_num_workers=dataloader_num_workers,
         dataloader_pin_memory=dataloader_pin_memory,

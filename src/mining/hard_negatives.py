@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
@@ -123,6 +124,22 @@ def _encodar_nas_duas_gpus(
     O pool e fechado antes de voltar, para liberar a copia extra do modelo.
     """
     print(f"Vetorizando o corpus em {len(dispositivos)} GPUs: {', '.join(dispositivos)}")
+    # O pool do Sentence Transformers move o modelo para a CPU e o deixa la. Sem devolver,
+    # as ementas da busca eram vetorizadas na CPU: 7 s por processo com as GPUs a 0%.
+    dispositivo_original = modelo.device
+    try:
+        return _encodar_com_pool(modelo, textos, batch_size, show_progress, dispositivos)
+    finally:
+        modelo.to(dispositivo_original)
+
+
+def _encodar_com_pool(
+    modelo: SentenceTransformer,
+    textos: list[str],
+    batch_size: int,
+    show_progress: bool,
+    dispositivos: list[str],
+) -> np.ndarray:
     # Nao e DDP: cada processo vetoriza um pedaco e a biblioteca junta na ordem original.
     if _encode_aceita_duas_gpus(modelo):
         embeddings = modelo.encode(
@@ -475,50 +492,6 @@ def _juntar_topk(
     # O sinal negativo coloca os mais similares primeiro. O mascarado (_VALOR_MASCARA) vai para o fim.
     ordem = np.argsort(-scores, axis=1)[:, :k_final]
     return np.take_along_axis(scores, ordem, axis=1), np.take_along_axis(indices, ordem, axis=1)
-
-
-def _coletar_linhas_do_corpus(
-    indices: np.ndarray,
-    shards: list[tuple[int, torch.Tensor]] | None,
-    corpus_embs_gpu: torch.Tensor | None,
-    dispositivo: torch.device,
-    dtype_tensor: torch.dtype,
-) -> torch.Tensor:
-    """
-    Copia so as linhas pedidas a partir da matriz que ja esta na GPU.
-    Nao volta no .npy mapeado em disco.
-    """
-    idx = torch.as_tensor(np.ascontiguousarray(indices, dtype=np.int64), dtype=torch.long)
-    if idx.ndim != 1:
-        idx = idx.reshape(-1)
-    if shards is None:
-        if corpus_embs_gpu is None:
-            raise RuntimeError("Matriz do corpus ausente na GPU.")
-        dim = corpus_embs_gpu.shape[1]
-        fonte = corpus_embs_gpu
-    else:
-        dim = shards[0][1].shape[1]
-        fonte = None
-    if idx.numel() == 0:
-        return torch.empty((0, dim), device=dispositivo, dtype=dtype_tensor)
-
-    # Uma placa: a matriz inteira ja esta em corpus_embs_gpu.
-    if fonte is not None:
-        return fonte.index_select(0, idx.to(fonte.device)).to(device=dispositivo, dtype=dtype_tensor)
-
-    # Duas placas: cada indice global cai numa fatia. O local e indice menos o offset.
-    saida = torch.empty((idx.shape[0], dim), device=dispositivo, dtype=dtype_tensor)
-    idx_cpu = idx.cpu()
-    for offset, matriz in shards:
-        n_local = matriz.shape[0]
-        no_shard = (idx_cpu >= offset) & (idx_cpu < offset + n_local)
-        if not bool(no_shard.any()):
-            continue
-        posicoes = torch.nonzero(no_shard, as_tuple=False).squeeze(1)
-        locais = (idx_cpu[no_shard] - offset).to(device=matriz.device)
-        linhas = matriz.index_select(0, locais).to(device=dispositivo, dtype=dtype_tensor)
-        saida[posicoes.to(dispositivo)] = linhas
-    return saida
 
 
 def _caminho_sidecar_progresso(saida: Path) -> Path:
@@ -959,6 +932,7 @@ def minerar_tripletos_contrastivos(
             unit="proc",
         ) as barra:
             for start in range(inicio, len(processos_validos), query_batch_size):
+                t_inicio = time.perf_counter()
                 batch_procs = processos_validos[start : start + query_batch_size]
                 queries_formatadas = [
                     preparar_query_com_instrucao(p.ementa, query_instruction)
@@ -975,19 +949,23 @@ def minerar_tripletos_contrastivos(
                         show_progress_bar=False,
                     ).to(dtype=dtype_tensor, device=device)
 
+                    # As contas por processo ficam na CPU, com estes vetores e a matriz do .npy
+                    q_embs_cpu = q_embs_gpu.float().cpu().numpy()
                     # Grava antes do progresso: lote no sidecar sempre tem os vetores no disco
-                    np.save(pasta_consultas / f"lote_{start:08d}.npy", q_embs_gpu.float().cpu().numpy().astype(np.float16))
+                    np.save(pasta_consultas / f"lote_{start:08d}.npy", q_embs_cpu.astype(np.float16))
                     (pasta_consultas / f"lote_{start:08d}.json").write_text(
                         json.dumps([p.id_global for p in batch_procs]), encoding="utf-8"
                     )
 
                     # Duas placas: top-k em cada metade e juncao. Uma placa: a matriz inteira, como antes.
+                    t_consultas = time.perf_counter()
                     if shards is not None:
+                        q_embs_host = torch.from_numpy(q_embs_cpu)
                         partes_scores = []
                         partes_indices = []
                         for offset, matriz in shards:
                             scores_fatia, indices_fatia = _topk_numa_fatia(
-                                q_embs=q_embs_gpu,
+                                q_embs=q_embs_host,
                                 matriz=matriz,
                                 offset=offset,
                                 batch_procs=batch_procs,
@@ -1017,7 +995,9 @@ def minerar_tripletos_contrastivos(
                         top_scores_cpu = top_scores_gpu.cpu().float().numpy()
                         top_indices_cpu = top_indices_gpu.cpu().numpy()
 
-                # Processamento dos candidatos. Vetores vêm da GPU, nao do .npy.
+                t_busca = time.perf_counter()
+                # Processamento dos candidatos na CPU: poucas linhas por processo (~10 positivos x
+                # ~400 candidatos), lidas da matriz do .npy.
                 for i_local, proc in enumerate(batch_procs):
                     stats["processos_avaliados"] += 1
                     pos_indices = indices_por_processo[proc.id_global]
@@ -1033,10 +1013,8 @@ def minerar_tripletos_contrastivos(
 
                     # Similaridade consulta -> positivos, para todos os processos (calibrar a faixa)
                     pos_indices_array = np.array(pos_indices, dtype=np.int64)
-                    pos_embs_f32 = _coletar_linhas_do_corpus(
-                        pos_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
-                    ).float()
-                    scores_pos_vec = torch.matmul(pos_embs_f32, q_embs_gpu[i_local].float()).cpu().numpy()
+                    pos_embs_f32 = np.asarray(corpus_embs_cpu[pos_indices_array], dtype=np.float32)
+                    scores_pos_vec = pos_embs_f32 @ q_embs_cpu[i_local]
                     limpos = [s for s, i in zip(scores_pos_vec, pos_indices) if not chunks_corpus[i].contem_vazamento_ementa]
                     validos_q = cands_score_q[cands_score_q > _LIMITE_MASCARADO]
                     if len(validos_q):
@@ -1052,11 +1030,9 @@ def minerar_tripletos_contrastivos(
 
                     cand_indices_array = np.array([idx for idx, _ in candidatos_validos], dtype=np.int64)
                     cand_scores_q_array = np.array([s for _, s in candidatos_validos], dtype=np.float32)
-                    cand_embs_f32 = _coletar_linhas_do_corpus(
-                        cand_indices_array, shards, corpus_embs_gpu, device, dtype_tensor
-                    ).float()
-                    # (n_pos, n_cand): so os vetores deste processo, ja na GPU.
-                    sims_p_mat = torch.matmul(pos_embs_f32, cand_embs_f32.T).cpu().numpy()
+                    cand_embs_f32 = np.asarray(corpus_embs_cpu[cand_indices_array], dtype=np.float32)
+                    # (n_pos, n_cand): so os vetores deste processo
+                    sims_p_mat = pos_embs_f32 @ cand_embs_f32.T
 
                     for j_pos, pos_idx in enumerate(pos_indices):
                         ch_positivo = chunks_corpus[pos_idx]
@@ -1117,6 +1093,11 @@ def minerar_tripletos_contrastivos(
                         if margem < 0:
                             stats["tuplas_com_negativo_acima_do_positivo"] += 1
 
+                t_tuplas = time.perf_counter()
+                tqdm.write(
+                    f"Lote {start:,}: consultas {t_consultas - t_inicio:.1f}s | busca {t_busca - t_consultas:.1f}s"
+                    f" | tuplas {t_tuplas - t_busca:.1f}s"
+                )
                 # Processo so entra no sidecar depois do lote inteiro gravado e com flush.
                 _gravar_progresso(
                     caminho_progresso,

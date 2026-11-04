@@ -19,6 +19,7 @@ Uso:
     python scripts/04_train.py --negativos nenhum
     python scripts/04_train.py --negativos aleatorios --limite_tuplas 50000
     python scripts/04_train.py --gpus 0,1
+    python scripts/04_train.py --negativos nenhum --limite_tuplas 5120 --diagnostico --output_dir experiments/diag/A
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ import os
 import argparse
 import json
 import random
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -115,6 +117,31 @@ def _imprimir(mensagem: str) -> None:
         print(mensagem)
 
 
+def _conferir_validacao_inicial(metricas: dict[str, float], minimo: float, dispositivo: str) -> None:
+    """
+    Para o treino quando o modelo ja comeca quebrado. O modelo base acerta bem a validacao
+    (MRR@10 ~0,5 ou mais); um MRR perto de zero no passo 0 indica erro na montagem do modelo,
+    e treinar por horas a partir dele invalidaria a comparacao das variantes.
+    A decisao e do rank 0 e vale para todos, para nenhuma GPU ficar presa esperando a outra.
+    """
+    mrr = next((v for k, v in metricas.items() if k.endswith("mrr@10")), None)
+    abortar = mrr is not None and mrr < minimo
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        sinal = torch.tensor([1.0 if abortar else 0.0], device=dispositivo)
+        torch.distributed.broadcast(sinal, src=0)
+        abortar = bool(sinal.item())
+    if mrr is not None:
+        _imprimir(f"MRR@10 da validacao no passo 0: {mrr:.4f} (minimo exigido: {minimo})")
+    if abortar:
+        _imprimir(
+            "ERRO: o modelo ja comeca muito abaixo do base na validacao. Treino interrompido. "
+            "Rode 'bash node2/rodar.sh testar_modelo' para comparar as formas de carregar o modelo."
+        )
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+        sys.exit(2)
+
+
 def _resolver_gpus(args: argparse.Namespace, cfg_train: dict[str, Any]) -> str:
     if args.gpus is not None:
         return args.gpus.strip()
@@ -137,15 +164,14 @@ def _preparar_gpus(gpus: str) -> None:
     if len(ids) == 1:
         return
 
-    # Rendezvous fixo em 127.0.0.1. O --standalone anuncia o hostname do no, e no gpunode02
-    # ele resolve para um endereco inalcancavel (errno 101). Um no so: tudo pelo loopback.
-    import socket
-    endereco = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    # Rendezvous fixo em 127.0.0.1. O --standalone anuncia o hostname do no (gpunode02),
+    # que no cluster aponta para uma interface sem rota: "errno 101 - Network is unreachable".
+    # Um no so: backend estatico, NCCL e Gloo tambem ficam no loopback.
     porta = os.environ.get("MASTER_PORT")
     if not porta:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((endereco, 0))
-            porta = str(s.getsockname()[1])
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            porta = str(sock.getsockname()[1])
     os.environ.setdefault("NCCL_SOCKET_IFNAME", "lo")
     os.environ.setdefault("GLOO_SOCKET_IFNAME", "lo")
 
@@ -153,11 +179,16 @@ def _preparar_gpus(gpus: str) -> None:
         sys.executable,
         "-m",
         "torch.distributed.run",
-        "--nnodes", "1",
-        "--node_rank", "0",
-        "--rdzv_backend", "static",
-        "--master_addr", endereco,
-        "--master_port", porta,
+        "--nnodes",
+        "1",
+        "--node_rank",
+        "0",
+        "--rdzv_backend",
+        "static",
+        "--master_addr",
+        "127.0.0.1",
+        "--master_port",
+        str(porta),
         "--nproc_per_node",
         str(len(ids)),
         str(Path(__file__).resolve()),
@@ -260,6 +291,30 @@ def parse_args() -> argparse.Namespace:
         help="Sobrescreve a frequencia de avaliacao intermediaria (eval_steps).",
     )
     parser.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=None,
+        help="Sobrescreve treinamento.warmup_ratio.",
+    )
+    parser.add_argument(
+        "--pesos_fp32",
+        action="store_true",
+        help="Full fine-tuning com pesos em fp32 e bf16 so na autocast. Sobrescreve treinamento.pesos_fp32.",
+    )
+    parser.add_argument(
+        "--gradient_checkpointing",
+        action="store_true",
+        help="Liga o gradient checkpointing (necessario com --pesos_fp32 na H200).",
+    )
+    parser.add_argument(
+        "--diagnostico",
+        action="store_true",
+        help=(
+            "Treino curto para conferir a otimizacao: loss e grad_norm a cada passo, validacao antes do "
+            "1o passo e nenhum checkpoint ou modelo gravado."
+        ),
+    )
+    parser.add_argument(
         "--resume_from_checkpoint",
         type=str,
         default=None,
@@ -329,13 +384,16 @@ def main() -> None:
     lr = args.lr or train_cfg.get("learning_rate", 2.0e-5)
     weight_decay = train_cfg.get("weight_decay", 0.01)
     epochs = args.epochs or train_cfg.get("num_epochs", 1)
-    warmup_ratio = train_cfg.get("warmup_ratio", 0.05)
+    warmup_ratio = args.warmup_ratio if args.warmup_ratio is not None else train_cfg.get("warmup_ratio", 0.05)
     precisao = str(train_cfg.get("precisao", "auto"))
     limite_tuplas = args.limite_tuplas or train_cfg.get("limite_tuplas")
     save_total_limit = int(train_cfg.get("save_total_limit", 2))
     cfg_lora = cfg_train.get("lora", {}) or {}
     usar_lora = bool(cfg_lora.get("ativo", False))
-    grad_checkpointing = train_cfg.get("gradient_checkpointing", False)
+    grad_checkpointing = args.gradient_checkpointing or train_cfg.get("gradient_checkpointing", False)
+    pesos_fp32 = args.pesos_fp32 or bool(train_cfg.get("pesos_fp32", False))
+    logging_steps = 1 if args.diagnostico else int(train_cfg.get("logging_steps", 10))
+    avaliar_no_inicio = args.diagnostico or bool(train_cfg.get("avaliar_no_inicio", False))
     num_workers = train_cfg.get("dataloader_num_workers", 4)
     pin_memory = train_cfg.get("dataloader_pin_memory", False)
     eval_steps = train_cfg.get("eval_steps", 250)
@@ -361,6 +419,9 @@ def main() -> None:
     _imprimir(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
     _imprimir(f"Precisao mista       : {precisao_mista} | Atencao: {attn_impl}")
     _imprimir(f"LoRA                 : {usar_lora} | Limite de tuplas: {limite_tuplas or 'todas'}")
+    _imprimir(f"Pesos em fp32        : {pesos_fp32} | Gradient checkpointing: {grad_checkpointing}")
+    if args.diagnostico:
+        _imprimir("Modo diagnostico     : log a cada passo, validacao no passo 0, sem checkpoints")
     _imprimir(f"Dataloader Workers   : {num_workers} | Pin Memory: {pin_memory}")
     _imprimir("-" * 64)
 
@@ -373,6 +434,7 @@ def main() -> None:
         device=dispositivo,
         precisao=precisao,
         lora=cfg_lora,
+        pesos_fp32=pesos_fp32,
     )
 
     # 2. Carregamento do Dataset de Tripletos
@@ -444,6 +506,8 @@ def main() -> None:
         save_total_limit=save_total_limit,
         # Com LoRA o checkpoint guarda so o adaptador. O melhor e avaliado pelo caminho, na Etapa 5.
         carregar_melhor_no_fim=not usar_lora,
+        logging_steps=logging_steps,
+        salvar_checkpoints=not args.diagnostico,
         seed=seed,
     )
 
@@ -466,7 +530,19 @@ def main() -> None:
         _imprimir(f"Retomando treinamento a partir do checkpoint: {resume}")
     else:
         _imprimir("Disparando treinamento contrastivo com telemetria cientifica...")
+    # Validacao com os pesos do modelo base, para a curva comecar no passo 0
+    if avaliar_no_inicio and evaluator is not None and not resume:
+        _imprimir("Validacao no passo 0 (modelo base)...")
+        metricas_passo0 = trainer.evaluate()
+        minimo_mrr = float(cfg_train.get("avaliacao", {}).get("mrr_minimo_passo0", 0.2))
+        _conferir_validacao_inicial(metricas_passo0 or {}, minimo_mrr, dispositivo)
     trainer.train(resume_from_checkpoint=resume)
+
+    if args.diagnostico:
+        _imprimir("Diagnostico concluido: nenhum modelo gravado.")
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        return
 
     # 5. Salvamento do Modelo Final (somente o processo da primeira GPU)
     if _processo_principal():
@@ -474,6 +550,10 @@ def main() -> None:
         # Sem LoRA, load_best_model_at_end ja trouxe o melhor. Com LoRA, este e o ultimo passo.
         nome_final = "modelo_final" if usar_lora else "best_model_4b"
         best_model_path = dir_saida / nome_final
+        # Pesos em fp32 so servem ao otimizador. O modelo final vai em bf16 (~8 GB em vez de ~16 GB),
+        # a mesma precisao em que a Etapa 5 avalia.
+        if pesos_fp32 and not usar_lora and precisao_mista == "bf16":
+            modelo_salvar.to(torch.bfloat16)
         modelo_salvar.save(str(best_model_path))
 
         melhor_ckpt = trainer.state.best_model_checkpoint
