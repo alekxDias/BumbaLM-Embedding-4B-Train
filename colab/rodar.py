@@ -365,6 +365,15 @@ def modo_checar(_args: argparse.Namespace) -> None:
         node2 = versoes_node2.get(pacote, "")
         aviso = "" if not node2 or local.split("+")[0] == node2.split("+")[0] else "   <- difere do node2"
         print(f"  {pacote:24s} {local:18s} node2: {node2 or '?'}{aviso}")
+    torchao = versao_pacote("torchao")
+    if torchao != "-":
+        try:
+            antigo = tuple(int(p) for p in torchao.split("+")[0].split(".")[:2]) < (0, 16)
+        except ValueError:
+            antigo = False
+        if antigo:
+            print(f"  ERRO: torchao {torchao} instalado. O peft recusa criar o LoRA com torchao < 0.16. "
+                  "Rode: pip uninstall -y torchao (o pipeline nao usa esse pacote).")
 
     titulo("Dados")
     pasta = dir_dados(cfg_base)
@@ -490,8 +499,12 @@ def _rodada_calibracao(nome: str, variante: str, mini_batch: int, checkpointing:
                                  "gradient_checkpointing": checkpointing}
     salvo = CALIBRACAO / f"{nome}.json"
     if salvo.is_file():
-        print(f"Calibracao '{nome}' ja feita: {salvo}")
-        return json.loads(salvo.read_text(encoding="utf-8"))
+        anterior = json.loads(salvo.read_text(encoding="utf-8"))
+        # Rodada que falhou por erro (pacote, caminho...) e refeita; so memoria e resultado medido valem.
+        if anterior.get("status") in ("ok", "sem_memoria", "memoria_no_limite"):
+            print(f"Calibracao '{nome}' ja feita: {salvo}")
+            return anterior
+        print(f"Calibracao '{nome}' anterior terminou com '{anterior.get('status')}'. Refazendo.")
 
     cfg = json.loads(json.dumps(cfg_train))
     cfg["treinamento"]["mini_batch_size"] = mini_batch
@@ -552,7 +565,8 @@ def modo_calibrar(args: argparse.Namespace) -> None:
     ]
     validas = [r for r in rodadas if r.get("status") == "ok" and r.get("segundos_por_passo")]
     if not validas:
-        raise SystemExit("ERRO: nenhuma configuracao de memoria funcionou. Veja os logs em " + str(LOGS))
+        resumo = ", ".join(f"{r['nome']}: {r.get('status')}" for r in rodadas)
+        raise SystemExit(f"ERRO: nenhuma configuracao de memoria funcionou ({resumo}). Veja os logs em {LOGS}")
     melhor = min(validas, key=lambda r: r["segundos_por_passo"])
     print(f"\nConfiguracao escolhida: mini-lote {melhor['mini_batch_size']}, "
           f"gradient checkpointing {melhor['gradient_checkpointing']} ({melhor['segundos_por_passo']:.1f} s/passo)")
