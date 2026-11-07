@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -298,6 +299,93 @@ def formatar_metricas_ir(metricas: dict[str, float], prefixo_nome: str = "") -> 
     return resultado
 
 
+def _capturar_resultados_por_consulta(evaluator: Any) -> list[list[dict[str, Any]]]:
+    """
+    Faz o evaluator guardar a lista de resultados (top-k de cada consulta) que ele ja calcula
+    internamente antes de tirar as medias. Nao recalcula nada: so copia o que passa por
+    compute_metrics. A lista devolvida e preenchida quando o evaluator roda.
+    """
+    capturados: list[list[dict[str, Any]]] = []
+    original = evaluator.compute_metrics
+
+    def compute_metrics_com_captura(queries_result_list, *args, **kwargs):
+        capturados.append(queries_result_list)
+        return original(queries_result_list, *args, **kwargs)
+
+    evaluator.compute_metrics = compute_metrics_com_captura
+    return capturados
+
+
+def _dcg(relevancias: list[int], k: int) -> float:
+    return sum(rel / math.log2(i + 2) for i, rel in enumerate(relevancias[:k]))
+
+
+def calcular_metricas_por_consulta(evaluator: Any, queries_result_list: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """
+    Metricas de cada consulta com as mesmas formulas do InformationRetrievalEvaluator
+    (a media destas linhas reproduz o resultado global). Servem para testes pareados
+    (bootstrap, Wilcoxon) entre modelos: o query_id e o mesmo em todos os modelos.
+    """
+    linhas: list[dict[str, Any]] = []
+    for indice, resultados in enumerate(queries_result_list):
+        query_id = evaluator.queries_ids[indice]
+        relevantes = evaluator.relevant_docs[query_id]
+        ordenados = sorted(resultados, key=lambda x: x["score"], reverse=True)
+        acertos = [1 if hit["corpus_id"] in relevantes else 0 for hit in ordenados]
+
+        posicao = next((i + 1 for i, a in enumerate(acertos) if a), None)
+        linha: dict[str, Any] = {
+            "query_id": query_id,
+            "n_relevantes": len(relevantes),
+            # 1 = primeiro lugar. None = nenhum relevante entre os resultados guardados (top 100).
+            "posicao_primeiro_relevante": posicao,
+        }
+        for k in (1, 5, 10):
+            linha[f"accuracy@{k}"] = 1.0 if any(acertos[:k]) else 0.0
+        linha["mrr@10"] = 1.0 / posicao if posicao is not None and posicao <= 10 else 0.0
+        linha["ndcg@10"] = _dcg(acertos, 10) / _dcg([1] * len(relevantes), 10)
+        linha["precision@10"] = sum(acertos[:10]) / 10
+        linha["recall@10"] = sum(acertos[:10]) / len(relevantes)
+
+        soma_precisoes = 0.0
+        corretos = 0
+        for i, a in enumerate(acertos[:100]):
+            if a:
+                corretos += 1
+                soma_precisoes += corretos / (i + 1)
+        linha["map@100"] = soma_precisoes / min(100, len(relevantes))
+
+        # Os 10 primeiros, para analise de erros sem precisar rodar o modelo de novo
+        linha["top10"] = [[hit["corpus_id"], round(float(hit["score"]), 5)] for hit in ordenados[:10]]
+        linhas.append(linha)
+    return linhas
+
+
+def gravar_resultados_por_consulta(
+    linhas: list[dict[str, Any]],
+    metricas_global: dict[str, float],
+    caminho: Path,
+) -> None:
+    """Grava uma linha JSON por consulta e confere que as medias batem com as do evaluator."""
+    with caminho.open("w", encoding="utf-8") as f:
+        for linha in linhas:
+            f.write(json.dumps(linha, ensure_ascii=False) + "\n")
+
+    maior_diferenca = 0.0
+    for metrica in ("mrr@10", "ndcg@10", "accuracy@1", "accuracy@10", "map@100"):
+        if metrica in metricas_global and linhas:
+            media = sum(l[metrica] for l in linhas) / len(linhas)
+            maior_diferenca = max(maior_diferenca, abs(media - metricas_global[metrica]))
+    print(f"Resultados por consulta salvos em: {caminho} ({len(linhas):,} consultas)")
+    if maior_diferenca > 1e-4:
+        print(
+            f"  - AVISO: as medias por consulta diferem do resultado global em ate {maior_diferenca:.5f}. "
+            "Confira a versao do sentence-transformers antes de usar este arquivo."
+        )
+    else:
+        print(f"  - Conferencia: medias por consulta iguais as globais (diferenca maxima {maior_diferenca:.1e})")
+
+
 def executar_avaliacao_completa(
     model: Union[SentenceTransformer, str, Path],
     caminho_processos: Path | str,
@@ -308,10 +396,12 @@ def executar_avaliacao_completa(
     excluir_chunks_contaminados: bool = True,
     batch_size: int = 64,
     avaliar_por_tribunal: bool = True,
+    gravar_por_consulta: bool = True,
 ) -> dict[str, Any]:
     """
     Executa a avaliacao de IR de ponta a ponta:
-    1. Avaliacao global no conjunto completo.
+    1. Avaliacao global no conjunto completo. Com gravar_por_consulta, grava tambem
+       por_consulta_<nome_avaliacao>.jsonl (uma linha por ementa) para testes de significancia.
     2. Avaliacoes segmentadas por tribunal (se habilitado).
     3. Gravacao de relatorio em texto formatado e arquivo JSON com as metricas.
     """
@@ -342,6 +432,7 @@ def executar_avaliacao_completa(
         excluir_chunks_contaminados=excluir_chunks_contaminados,
         batch_size=batch_size,
     )
+    capturados = _capturar_resultados_por_consulta(evaluator_global) if gravar_por_consulta and dir_saida else None
 
     metricas_brutas_global = evaluator_global(
         modelo_instanciado,
@@ -350,6 +441,19 @@ def executar_avaliacao_completa(
     metricas_global = formatar_metricas_ir(metricas_brutas_global, prefixo_nome=f"{nome_avaliacao}_global")
     relatorio_geral["metricas_global"] = metricas_global
     relatorio_geral["protocolo"] = getattr(evaluator_global, "estatisticas_bumbalm", {})
+
+    # 1b. Resultado de cada consulta. Uma falha aqui nao derruba a avaliacao: as medias ja estao prontas.
+    if capturados is not None:
+        try:
+            if not capturados:
+                raise RuntimeError("o evaluator nao passou por compute_metrics")
+            linhas = calcular_metricas_por_consulta(evaluator_global, capturados[-1])
+            caminho_consultas = dir_saida / f"por_consulta_{nome_avaliacao}.jsonl"
+            gravar_resultados_por_consulta(linhas, metricas_global, caminho_consultas)
+            relatorio_geral["arquivo_por_consulta"] = str(caminho_consultas)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Nao foi possivel gravar os resultados por consulta: %s", exc)
+            print(f"  - AVISO: resultados por consulta NAO gravados ({exc}). As medias continuam validas.")
 
     # 2. Avaliacao Segmentada por Tribunal
     if avaliar_por_tribunal:
