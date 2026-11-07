@@ -9,6 +9,8 @@ Executa:
 3. Avaliacao opcional do modelo base zero-shot (--compare_baseline).
 4. Execucao da avaliacao de Information Retrieval (IR) com o mesmo corpus para todos os modelos.
 5. Emissao de relatorios consolidados (JSON e TXT) com nDCG@10, MRR@10, Acc@1, 5, 10 e MAP@100.
+6. Resultado de cada consulta em <split>/<modelo>/por_consulta_<split>_<modelo>.jsonl, com o mesmo
+   query_id em todos os modelos, para testes de significancia pareados feitos depois, sem GPU.
 
 Os modelos sao carregados um por vez, na precisao da GPU (fp16 na V100), e liberados em seguida.
 
@@ -23,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import gc
-import importlib
 import json
 import logging
 import sys
@@ -97,6 +98,14 @@ def parse_args() -> argparse.Namespace:
         help="Avalia tambem o modelo base zero-shot.",
     )
     parser.add_argument(
+        "--pular_avaliados",
+        action="store_true",
+        help=(
+            "Reaproveita os modelos que ja tem metricas_<split>_<modelo>.json na pasta de saida. "
+            "Serve para retomar a avaliacao depois de uma queda (Colab) sem refazer os modelos prontos."
+        ),
+    )
+    parser.add_argument(
         "--baseline_id",
         type=str,
         default=None,
@@ -140,6 +149,10 @@ def descobrir_variantes(dir_experimento: Path) -> dict[str, str]:
     for registro in sorted(dir_experimento.glob("*/melhor_checkpoint.json")):
         dados = json.loads(registro.read_text(encoding="utf-8"))
         caminho = dados.get("modelo_para_avaliar") or dados.get("modelo_final")
+        # O JSON guarda o caminho absoluto de quando o treino rodou. Se a pasta mudou de lugar
+        # (Drive montado em outro caminho, copia para outra maquina), procura o modelo dentro da variante.
+        if caminho and not Path(caminho).exists() and (registro.parent / Path(caminho).name).exists():
+            caminho = str(registro.parent / Path(caminho).name)
         if caminho and Path(caminho).exists():
             modelos[registro.parent.name] = caminho
         else:
@@ -153,33 +166,24 @@ def descobrir_variantes(dir_experimento: Path) -> dict[str, str]:
 def _carregar_checkpoint_lora(pasta: Path, dispositivo: str, dtype: torch.dtype, max_seq_length: int) -> SentenceTransformer:
     """
     Checkpoint de treino com LoRA guarda so o adaptador (adapter_config.json e
-    adapter_model.safetensors), sem o config.json do modelo base: SentenceTransformer(pasta)
-    falha com "Unrecognized model". Monta o Transformer a partir do modelo base, le os demais
-    modulos (pooling, normalizacao) da propria pasta e aplica o adaptador por cima.
+    adapter_model.safetensors), sem o config.json do modelo base.
+
+    Carrega o modelo base do mesmo jeito que o treino (SentenceTransformer(base), pipeline do Hub com
+    Pooling last-token e Normalize) e aplica o adaptador por cima. A montagem manual dos modulos
+    (models.Transformer + Pooling + Normalize) dava um modelo diferente no sentence-transformers do
+    node2 (MRR 0,04 contra 0,54 do base), entao nao e mais usada.
     """
-    from sentence_transformers import models
-
     base = json.loads((pasta / "adapter_config.json").read_text(encoding="utf-8"))["base_model_name_or_path"]
-    modulos = []
-    transformer = None
-    for entrada in json.loads((pasta / "modules.json").read_text(encoding="utf-8")):
-        if entrada.get("path", "") == "":
-            transformer = models.Transformer(
-                base,
-                max_seq_length=max_seq_length,
-                model_args={"torch_dtype": dtype, "trust_remote_code": True},
-                tokenizer_args={"padding_side": "left"},
-            )
-            modulos.append(transformer)
-        else:
-            nome_modulo, nome_classe = entrada["type"].rsplit(".", 1)
-            classe = getattr(importlib.import_module(nome_modulo), nome_classe)
-            modulos.append(classe.load(str(pasta / entrada["path"])))
-    if transformer is None:
-        raise ValueError(f"modules.json de {pasta} nao tem o modulo Transformer na raiz.")
-
+    modelo = SentenceTransformer(
+        base,
+        trust_remote_code=True,
+        device=dispositivo,
+        model_kwargs={"torch_dtype": dtype},
+        tokenizer_kwargs={"padding_side": "left"},
+    )
+    modelo.max_seq_length = max_seq_length
+    transformer = modelo[0]
     transformer.auto_model.load_adapter(str(pasta))
-    modelo = SentenceTransformer(modules=modulos, device=dispositivo)
 
     # Confere que o adaptador muda a saida: um LoRA que nao foi aplicado avaliaria o modelo base
     sonda = ["recurso de apelacao conhecido e desprovido"]
@@ -336,6 +340,16 @@ def main() -> None:
     # Um modelo por vez na GPU: dois 4B em fp16 nao cabem com folga em 32 GB
     resultados: dict[str, dict[str, Any]] = {split: {} for split in arquivos_split}
     for nome, caminho in modelos.items():
+        if args.pular_avaliados:
+            prontos = {
+                split_nome: dir_saida / split_nome / nome / f"metricas_{split_nome}_{nome}.json"
+                for split_nome in arquivos_split
+            }
+            if prontos and all(p.is_file() for p in prontos.values()):
+                for split_nome, p in prontos.items():
+                    resultados[split_nome][nome] = json.loads(p.read_text(encoding="utf-8"))
+                print(f"\nModelo '{nome}' ja avaliado: metricas lidas de {dir_saida}")
+                continue
         print(f"\nCarregando modelo '{nome}': {caminho} ...")
         modelo = carregar_modelo_avaliacao(caminho, max_seq_length, precisao)
         for split_nome, (arq_processos, arq_chunks) in arquivos_split.items():

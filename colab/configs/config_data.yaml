@@ -1,0 +1,66 @@
+# Perfil Colab (1x A100 80 GB). Copia de configs/config_data.yaml sem nenhuma mudanca de valor:
+# no Colab os dados chegam prontos do node2 (divisao, trechos e tuplas). O treino so le n_negativos.
+# Confira com: diff configs/config_data.yaml colab/configs/config_data.yaml
+
+# Parametros de Preparacao de Dados, Chunking e Mineracao
+
+filtros:
+  min_caracteres_ementa: 50
+  min_caracteres_teor: 200
+  descartar_teor_menor_que_ementa: true
+  remover_html: true
+
+divisao_dados:
+  # Proporcoes da divisao (somatorio = 1.0)
+  train_ratio: 0.80
+  val_ratio: 0.10
+  test_ratio: 0.10
+  
+  # Estrategia: agrupar 100% dos chunks do mesmo processo e estratificar por tribunal
+  agrupar_por: "numero_processo"
+  estratificar_por: "tribunal"
+
+chunking:
+  model_id_tokenizer: "Qwen/Qwen3-Embedding-4B"
+  chunk_size_tokens: 768
+  chunk_overlap_tokens: 128
+  
+  # Auditoria de vazamento do Chunk 0
+  auditar_vazamento_ementa: true
+  # O acordao costuma reproduzir a ementa (no TJRS, no fim ou no meio). O bloco e recortado do
+  # teor antes do chunking quando cobre >= min_cobertura_bloco_ementa da ementa; frases soltas ficam.
+  remover_bloco_ementa: true
+  min_cobertura_bloco_ementa: 0.5
+  min_caracteres_contaminacao: 200
+  # Copia parcial: fracao das palavras da ementa copiada no chunk, em blocos de N palavras.
+  # Pega a ementa cortada na borda do chunk ou interrompida por rodape/numeracao.
+  # Calibre com o histograma de relatorio_auditoria_chunks.txt. null desliga.
+  limiar_cobertura_ementa: 0.30
+  min_palavras_cobertura: 12
+  ngram_cobertura: 6
+
+# Casos quase duplicados (litigancia em massa): ementas com Jaccard >= limiar
+# ficam no mesmo grupo, no mesmo split, e nao viram negativos umas das outras.
+# Em blocos de 5 palavras, trocar UMA palavra numa ementa de 150 ja leva o Jaccard a ~0,87;
+# nomes e valores diferentes descem mais. Calibre com o histograma de relatorio_preparacao_splits.txt.
+quase_duplicatas:
+  ativo: true
+  limiar_jaccard: 0.80
+  ngram: 5
+
+mineracao_negativos:
+  n_negativos: 5
+  limiar_similaridade_min: 0.60
+  limiar_similaridade_max: 0.85
+  # Teto relativo (NV-Retriever, Moreira et al., 2024): negativo < 95% da similaridade do positivo
+  # com a consulta. O teto fixo de 0.85 deixava passar negativos acima de positivos fracos
+  # (70% das tuplas no smoke do TJRS). Vale tambem para os negativos aleatorios. null desliga.
+  max_relativo_positivo: 0.95
+  top_k_candidatos: 200
+  
+  # Lotes de mineracao acelerada em GPU
+  # 256 na H200 (como na main). Na V100 de 32 GB era 32: la 64 ja estourava a memoria.
+  encode_batch_size: 256
+  query_batch_size: 256
+  # Vetorizacao do corpus em blocos retomaveis. Se o processo cair, recomeca do bloco seguinte.
+  bloco_vetorizacao: 20000

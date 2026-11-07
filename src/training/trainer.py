@@ -37,12 +37,101 @@ def _num_processos() -> int:
     return max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
 
+def chave_tupla(item: dict[str, Any]) -> str:
+    """Identifica o par (processo, trecho positivo). E a mesma nos arquivos de todas as variantes."""
+    positivo = item.get("positive_chunk_id")
+    if positivo is None:
+        positivo = item.get("positive_chunk_idx", "")
+    return f"{item.get('id_global', '')}|{positivo}"
+
+
+def _tupla_valida(item: dict[str, Any], n_negativos: int) -> bool:
+    query = str(item.get("query", "")).strip()
+    positive = str(item.get("positive", "")).strip()
+    negatives = [n for n in item.get("negatives", []) or [] if str(n).strip()]
+    return bool(query and positive and len(negatives) >= n_negativos)
+
+
+def _assinatura_arquivos(caminhos: list[Path]) -> str:
+    return ";".join(f"{p.name}:{p.stat().st_size}" for p in caminhos)
+
+
+def sortear_chaves_tuplas(
+    arquivos_referencia: list[Path | str],
+    limite_tuplas: int,
+    seed: int = 42,
+    n_negativos: int = 5,
+    arquivo_cache: Optional[Path | str] = None,
+) -> list[str]:
+    """
+    Sorteia limite_tuplas pares (processo, trecho positivo) validos em TODOS os arquivos de referencia
+    (tuplas dificeis e aleatorias). As tres variantes treinam com exatamente estes pares, mesmo que algum
+    arquivo tenha perdido uma tupla ou mudado a ordem das linhas. O sorteio parte da lista ordenada de
+    chaves, entao nao depende da ordem das linhas nos arquivos.
+
+    arquivo_cache: grava a lista (uma chave por linha, com cabecalho) e a reaproveita nas outras
+    variantes e nas retomadas, desde que os arquivos de referencia nao tenham mudado de tamanho.
+    """
+    import random
+
+    caminhos = [Path(c) for c in arquivos_referencia]
+    for caminho in caminhos:
+        if not caminho.is_file():
+            raise FileNotFoundError(f"Arquivo de tuplas nao encontrado: {caminho}")
+    cabecalho = f"# limite={int(limite_tuplas)} seed={seed} n_negativos={n_negativos} arquivos={_assinatura_arquivos(caminhos)}"
+
+    if arquivo_cache is not None and Path(arquivo_cache).is_file():
+        linhas = Path(arquivo_cache).read_text(encoding="utf-8").splitlines()
+        if linhas and linhas[0] == cabecalho:
+            chaves = [l for l in linhas[1:] if l.strip()]
+            _imprimir(f"Tuplas sorteadas lidas de {arquivo_cache} ({len(chaves):,} pares)")
+            return chaves
+        _imprimir(f"Aviso: {arquivo_cache} foi gerado com outros parametros ou arquivos. Sorteando de novo.")
+
+    comuns: Optional[set[str]] = None
+    for caminho in caminhos:
+        validas: set[str] = set()
+        with caminho.open(encoding="utf-8") as f:
+            for linha in f:
+                linha = linha.strip()
+                if not linha:
+                    continue
+                item = json.loads(linha)
+                if _tupla_valida(item, n_negativos):
+                    validas.add(chave_tupla(item))
+        _imprimir(f"  - {caminho.name}: {len(validas):,} pares validos")
+        comuns = validas if comuns is None else comuns & validas
+
+    disponiveis = sorted(comuns or set())
+    if not disponiveis:
+        raise ValueError("Nenhum par valido em comum entre os arquivos de tuplas.")
+    n = min(int(limite_tuplas), len(disponiveis))
+    chaves = random.Random(seed).sample(disponiveis, n)
+    _imprimir(f"Sorteio das tuplas: {n:,} de {len(disponiveis):,} pares em comum (semente {seed})")
+
+    if arquivo_cache is not None and _processo_principal():
+        destino = Path(arquivo_cache)
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        temporario = destino.with_name(destino.name + ".tmp")
+        temporario.write_text(cabecalho + "\n" + "\n".join(chaves) + "\n", encoding="utf-8")
+        temporario.replace(destino)
+    return chaves
+
+
+def hash_chaves_tuplas(chaves: list[str]) -> str:
+    """SHA-256 da lista de pares sorteados. Tem que ser igual nas tres variantes."""
+    import hashlib
+
+    return hashlib.sha256("\n".join(chaves).encode("utf-8")).hexdigest()
+
+
 def carregar_dataset_tripletos(
     caminho_arquivo: Path | str,
     n_negativos: int = 5,
     query_instruction: str = "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: ",
     limite_tuplas: Optional[int] = None,
     seed: int = 42,
+    chaves: Optional[list[str]] = None,
 ) -> Dataset:
     """
     Le o arquivo de tripletos minerados e monta o Dataset HuggingFace estruturado
@@ -50,8 +139,10 @@ def carregar_dataset_tripletos(
     ['anchor', 'positive', 'negative_0', ..., 'negative_4']
 
     Com n_negativos=0 restam ['anchor', 'positive']: a loss usa so os negativos do proprio lote.
-    limite_tuplas sorteia um subconjunto com a semente. Os arquivos de hard negatives e de
-    negativos aleatorios tem as mesmas linhas na mesma ordem, entao o sorteio pega os mesmos pares.
+    chaves: lista de pares de sortear_chaves_tuplas. Carrega so esses pares, na ordem da lista,
+    o que garante os mesmos pares e a mesma ordem nas tres variantes.
+    limite_tuplas (sem chaves): sorteio antigo pela posicao das linhas, que so pega os mesmos pares
+    se os arquivos das variantes tiverem as mesmas linhas na mesma ordem.
     """
     caminho = Path(caminho_arquivo)
     if not caminho.is_file():
@@ -63,6 +154,8 @@ def carregar_dataset_tripletos(
     lidos = 0
     validos = 0
     descartados = 0
+    posicao_chave = {c: i for i, c in enumerate(chaves)} if chaves is not None else None
+    selecionadas: dict[int, tuple[str, str, list[str]]] = {}
 
     with caminho.open(encoding="utf-8") as f:
         for linha in f:
@@ -83,6 +176,13 @@ def carregar_dataset_tripletos(
             # Aplica a instrucao formal na query se necessario
             anchor_texto = query if query.startswith("Instruct:") else f"{query_instruction}{query}"
 
+            if posicao_chave is not None:
+                posicao = posicao_chave.get(chave_tupla(item))
+                if posicao is not None and posicao not in selecionadas:
+                    selecionadas[posicao] = (anchor_texto, positive, negatives[:n_negativos])
+                validos += 1
+                continue
+
             dados["anchor"].append(anchor_texto)
             dados["positive"].append(positive)
             for i in range(n_negativos):
@@ -93,13 +193,26 @@ def carregar_dataset_tripletos(
     if validos == 0:
         raise ValueError(f"Nenhum tripleto valido com {n_negativos} negativos foi encontrado em {caminho}")
 
+    if posicao_chave is not None:
+        faltando = len(posicao_chave) - len(selecionadas)
+        if faltando:
+            raise ValueError(f"{faltando:,} pares sorteados nao estao em {caminho}. Refaca o sorteio.")
+        for posicao in range(len(posicao_chave)):
+            anchor_texto, positive, negatives = selecionadas[posicao]
+            dados["anchor"].append(anchor_texto)
+            dados["positive"].append(positive)
+            for i in range(n_negativos):
+                dados[f"negative_{i}"].append(negatives[i])
+
     import pyarrow as pa
     schema_large = pa.schema([pa.field(col, pa.large_string()) for col in colunas])
     tabela_arrow = pa.Table.from_pydict(dados, schema=schema_large)
     dataset = Dataset(tabela_arrow)
 
     _imprimir(f"Dataset de Treino Carregado: {validos:,} tripletos validos (descartados: {descartados:,})")
-    if limite_tuplas and len(dataset) > limite_tuplas:
+    if posicao_chave is not None:
+        _imprimir(f"  - Pares sorteados         : {len(dataset):,} (mesma lista nas tres variantes)")
+    elif limite_tuplas and len(dataset) > limite_tuplas:
         dataset = dataset.shuffle(seed=seed).select(range(int(limite_tuplas)))
         _imprimir(f"  - Subconjunto sorteado    : {len(dataset):,} tuplas (semente {seed})")
     _imprimir(f"  - Colunas                 : {dataset.column_names}")

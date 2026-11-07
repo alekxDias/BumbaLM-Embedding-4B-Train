@@ -1,0 +1,29 @@
+# Perfil Colab (1x A100 80 GB) - caminhos do Colab. O resto e igual a configs/config_base.yaml.
+# O colab/rodar.py copia esta pasta para o Drive (MyDrive/BumbaLM_colab/configs) na primeira vez e
+# depois usa SEMPRE a copia do Drive: e la que voce edita, e ela sobrevive as quedas do Colab.
+
+projeto:
+  nome: "BumbaLM-Embedding-4B-Train"
+  versao: "2.0.0"
+  descricao: "Pipeline modular para treinamento contrastivo de embeddings juridicos brasileiros"
+  seed: 42
+
+dados:
+  # Dados prontos copiados do node2 (data/processed_tjrs100k): divisao, trechos e tuplas mineradas.
+  # O rodar.py descompacta do Drive para o disco local do Colab (leitura muito mais rapida).
+  diretorio_processados: "/content/dados/processed_tjrs100k"
+  # So para as etapas 01-03, que no Colab nao rodam (os dados vem prontos do node2)
+  diretorio_base_pares: "/content/drive/MyDrive/BumbaLM_colab/pares"
+  arquivos_pares:
+    - "pares_tjrs_amostra100k.jsonl"
+  colunas:
+    tribunal: "str_tribunal"
+    numero_processo: "str_numero_unico"
+    ementa: "str_ementa"
+    inteiro_teor: "str_inteiro_teor"
+
+saidas:
+  # No Drive: checkpoints e resultados sobrevivem a queda da sessao.
+  diretorio_experimentos: "/content/drive/MyDrive/BumbaLM_colab/experiments"
+  # Cada variante grava em <diretorio_experimentos>/<nome_experimento>/<variante>/
+  nome_experimento: "tcc_tjrs100k_ablacao_negativos_colab_a100"

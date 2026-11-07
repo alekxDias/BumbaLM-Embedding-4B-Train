@@ -1,0 +1,102 @@
+# Perfil Colab: 1x A100 80 GB, LoRA. Compare com o perfil do node2: diff configs/config_train.yaml colab/configs/config_train.yaml
+#
+# O que muda em relacao ao node2 (2x H200, ajuste completo):
+#   - LoRA (r=16, alfa=32) em vez do ajuste completo: pesos fp32 + Adam do 4B passam de 64 GB antes das
+#     ativacoes e os checkpoints teriam ~48 GB, inviaveis no Drive. Com LoRA o checkpoint tem ~0,4 GB.
+#   - learning_rate 1e-4 (LoRA) em vez de 2e-5 (ajuste completo).
+#   - Uma GPU: o lote de 128 fica inteiro na A100 (no node2 eram 2 x 64 com gather_across_devices).
+#     Cada ancora continua disputando com as outras 127 tuplas do passo.
+#   - limite_tuplas: definido depois da calibracao (python colab/rodar.py calibrar), igual nas 3 variantes.
+# O que NAO muda: tuplas (mineradas no node2), 5 negativos, CachedMNRL com escala 50, 1 epoca, cosine com
+# 5% de aquecimento, 768 tokens, instrucao, semente, validacao (300 processos) e metrica de selecao.
+#
+# Esta copia vai para o Drive na primeira execucao. Edite a copia do Drive, nao a do repositorio.
+# O rodar.py recusa treinar uma variante com hiperparametros diferentes das ja treinadas.
+
+hardware:
+  # Uma GPU so. Vazio: sem DDP, sem torchrun.
+  gpus: ""
+
+modelo:
+  # Pasta local onde o rodar.py baixa o modelo (repo_hub na revisao_hub). Caminho local fixo para o
+  # modelo nunca ser atualizado no meio do experimento.
+  model_id: "/content/modelos/Qwen3-Embedding-4B"
+  repo_hub: "Qwen/Qwen3-Embedding-4B"
+  # Hash do snapshot usado no node2 (node2/exportar_para_colab.sh mostra). null baixa a versao atual
+  # do Hub e o rodar.py registra o hash baixado.
+  revisao_hub: null
+  max_seq_length: 768
+  query_instruction: "Instruct: Dado um trecho de um documento jurídico brasileiro, recupere o trecho mais relevante semanticamente.\nQuery: "
+  pooling_mode: "lasttoken"
+  normalizar_embeddings: true
+  # Na A100 o sdpa usa o kernel flash do proprio PyTorch em bf16.
+  attn_implementation: "sdpa"
+
+lora:
+  ativo: true
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+treinamento:
+  # Lote contrastivo inteiro na A100: 128 tuplas por passo, como as 2 x 64 do node2.
+  batch_size_train: 128
+  # So memoria (GradCache): nao muda o resultado. Escolha com a calibracao.
+  mini_batch_size: 16
+  gradient_accumulation_steps: 1
+
+  # "auto": bf16 na A100. Com LoRA a base fica em bf16 e so os adaptadores (fp32) treinam.
+  precisao: "auto"
+  # So memoria e velocidade, nao muda o resultado. Escolha com a calibracao.
+  gradient_checkpointing: true
+  pesos_fp32: false
+
+  logging_steps: 10
+  # Validacao no passo 0 com o modelo base: tem que ser igual nas tres variantes (e ~0,5 de MRR).
+  avaliar_no_inicio: true
+
+  # DEFINIR DEPOIS DA CALIBRACAO. null = todas as tuplas (como no node2); o rodar.py so treina com null
+  # se receber --todas_as_tuplas. O sorteio e pela chave (processo + trecho positivo): as tres variantes
+  # recebem exatamente os mesmos pares.
+  limite_tuplas: null
+
+  dataloader_num_workers: 4
+  dataloader_pin_memory: false
+
+  num_epochs: 1
+  learning_rate: 1.0e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.05
+  lr_scheduler_type: "cosine"
+
+  # DEFINIR DEPOIS DA CALIBRACAO (o rodar.py calibrar sugere os valores).
+  # save_steps: checkpoint a cada ~20-30 min, para perder pouco quando o Colab cair.
+  # eval_steps: ~10 validacoes no treino. Tem que ser multiplo de save_steps (o melhor checkpoint
+  # precisa existir em disco).
+  eval_steps: 100
+  save_steps: 20
+  # O ultimo e o melhor ficam (cada checkpoint LoRA tem ~0,4 GB).
+  save_total_limit: 2
+  apagar_checkpoints_ao_fim: false
+  metric_for_best_model: "val_cosine_ndcg@10"
+  greater_is_better: true
+
+loss:
+  nome: "CachedMultipleNegativesRankingLoss"
+  scale: 50.0
+
+avaliacao:
+  eval_batch_size: 128
+  # Mesma amostra fixa de validacao do node2 (mesma semente e mesmo arquivo de validacao).
+  max_processos_val: 300
+  # O treino para se a validacao do passo 0 ficar abaixo disto: o modelo base passa de 0,5.
+  mrr_minimo_passo0: 0.2
+  precisao: "auto"
+  metricas:
+    - "ndcg@10"
+    - "mrr@10"
+    - "accuracy@1"
+    - "accuracy@5"
+    - "accuracy@10"
+    - "map@100"

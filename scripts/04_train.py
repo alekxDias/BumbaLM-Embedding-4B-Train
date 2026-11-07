@@ -75,7 +75,12 @@ if hasattr(_tf_trainer.Trainer, "_load_rng_state"):
     _tf_trainer.Trainer._load_rng_state = _safe_load_rng_state
 
 from src.training.model_builder import construir_modelo_embedding
-from src.training.trainer import carregar_dataset_tripletos, configurar_treinador
+from src.training.trainer import (
+    carregar_dataset_tripletos,
+    configurar_treinador,
+    hash_chaves_tuplas,
+    sortear_chaves_tuplas,
+)
 from src.evaluation.ir_evaluator import criar_ir_evaluator
 from src.hardware import dtype_para_dispositivo
 
@@ -291,6 +296,12 @@ def parse_args() -> argparse.Namespace:
         help="Sobrescreve a frequencia de avaliacao intermediaria (eval_steps).",
     )
     parser.add_argument(
+        "--save_steps",
+        type=int,
+        default=None,
+        help="Sobrescreve a frequencia de checkpoints (save_steps). Use um divisor de eval_steps.",
+    )
+    parser.add_argument(
         "--warmup_ratio",
         type=float,
         default=None,
@@ -438,12 +449,37 @@ def main() -> None:
     )
 
     # 2. Carregamento do Dataset de Tripletos
+    # Com limite, os pares sao sorteados pela chave (processo + trecho positivo) entre os que existem
+    # nos arquivos das variantes com negativos explicitos: as tres variantes recebem os mesmos pares.
+    # A lista fica na pasta do experimento e e reaproveitada pelas outras variantes e nas retomadas.
+    chaves_tuplas = None
+    hash_tuplas = None
+    if limite_tuplas:
+        n_neg_referencia = int(cfg_data.get("mineracao_negativos", {}).get("n_negativos", 5))
+        referencias = [
+            dir_processados / nome
+            for nome in ("train_triplets.jsonl", "train_tuplas_aleatorias.jsonl")
+            if (dir_processados / nome).is_file()
+        ]
+        if Path(caminho_tripletos) not in referencias:
+            referencias.append(Path(caminho_tripletos))
+        chaves_tuplas = sortear_chaves_tuplas(
+            arquivos_referencia=referencias,
+            limite_tuplas=int(limite_tuplas),
+            seed=seed,
+            n_negativos=n_neg_referencia,
+            arquivo_cache=Path(dir_saida).parent / f"tuplas_sorteadas_n{int(limite_tuplas)}_s{seed}.txt",
+        )
+        hash_tuplas = hash_chaves_tuplas(chaves_tuplas)
+        _imprimir(f"Hash dos pares sorteados: {hash_tuplas} (tem que ser igual nas tres variantes)")
+
     train_dataset = carregar_dataset_tripletos(
         caminho_arquivo=caminho_tripletos,
         n_negativos=n_negativos,
         query_instruction=query_instruction,
         limite_tuplas=limite_tuplas,
         seed=seed,
+        chaves=chaves_tuplas,
     )
 
     # 3. Construcao do Avaliador de Validacao (InformationRetrievalEvaluator)
@@ -482,6 +518,8 @@ def main() -> None:
     greater_is_better = train_cfg.get("greater_is_better", cfg_train.get("greater_is_better", True))
     if args.eval_steps is not None:
         eval_steps = args.eval_steps
+    if args.save_steps is not None:
+        save_steps = args.save_steps
 
     trainer, telemetry = configurar_treinador(
         model=model,
@@ -562,7 +600,12 @@ def main() -> None:
             "n_negativos": n_negativos,
             "arquivo_tuplas": str(caminho_tripletos),
             "n_tuplas_treino": len(train_dataset),
+            "limite_tuplas": limite_tuplas,
+            "hash_tuplas_sorteadas": hash_tuplas,
             "lora": usar_lora,
+            "learning_rate": lr,
+            "batch_size_por_gpu": batch_size,
+            "num_gpus": num_processos,
             "precisao_mista": precisao_mista,
             "metrica_selecao": metric_best,
             "melhor_metrica": trainer.state.best_metric,
