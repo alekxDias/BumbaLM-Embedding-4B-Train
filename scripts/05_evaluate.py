@@ -40,6 +40,7 @@ from sentence_transformers import SentenceTransformer
 
 from src.evaluation.ir_evaluator import executar_avaliacao_completa
 from src.hardware import dtype_para_dispositivo
+from src.training.model_builder import carregar_pesos_lora
 
 logging.basicConfig(
     level=logging.INFO,
@@ -183,7 +184,10 @@ def _carregar_checkpoint_lora(pasta: Path, dispositivo: str, dtype: torch.dtype,
     )
     modelo.max_seq_length = max_seq_length
     transformer = modelo[0]
+    # O load_adapter cria as camadas LoRA, mas no transformers 5.0 nao copia os pesos deste
+    # adaptador (o modelo ficava igual ao base). Os pesos sao copiados e conferidos a seguir.
     transformer.auto_model.load_adapter(str(pasta))
+    n_tensores = carregar_pesos_lora(transformer.auto_model, pasta)
 
     # Confere que o adaptador muda a saida: um LoRA que nao foi aplicado avaliaria o modelo base
     sonda = ["recurso de apelacao conhecido e desprovido"]
@@ -191,10 +195,16 @@ def _carregar_checkpoint_lora(pasta: Path, dispositivo: str, dtype: torch.dtype,
     transformer.auto_model.disable_adapters()
     sem = modelo.encode(sonda, convert_to_tensor=True).float()
     transformer.auto_model.enable_adapters()
+    de_novo = modelo.encode(sonda, convert_to_tensor=True).float()
     diferenca = 1 - torch.nn.functional.cosine_similarity(com, sem).item()
-    print(f"  - LoRA de {pasta.name} aplicado sobre {base} (distancia da saida para o base: {diferenca:.4f})")
+    print(
+        f"  - LoRA de {pasta.name} aplicado sobre {base}: {n_tensores} tensores "
+        f"(distancia da saida para o base: {diferenca:.4f})"
+    )
     if diferenca < 1e-6:
-        print("  - AVISO: o adaptador nao mudou a saida. Este modelo vai se comportar como o base.")
+        raise RuntimeError(f"O adaptador de {pasta} nao mudou a saida: o modelo seria avaliado como o base.")
+    if 1 - torch.nn.functional.cosine_similarity(com, de_novo).item() > 1e-4:
+        raise RuntimeError("O adaptador nao voltou a ficar ativo depois da conferencia.")
     return modelo
 
 

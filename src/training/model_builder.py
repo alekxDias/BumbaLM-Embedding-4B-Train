@@ -7,6 +7,7 @@ from __future__ import annotations
 import gc
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 import torch
@@ -19,6 +20,56 @@ log = logging.getLogger("bumbalm_model_builder")
 
 # Projecoes de atencao e MLP do Qwen3.
 LORA_ALVOS_PADRAO = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+PREFIXO_PEFT = "base_model.model."
+
+
+def carregar_pesos_lora(auto_model: torch.nn.Module, pasta: str | Path) -> int:
+    """
+    Copia os pesos de <pasta>/adapter_model.safetensors para as camadas LoRA ja criadas no modelo.
+
+    O load_adapter do transformers 5.0 nao aplica as chaves de um adaptador salvo a partir de um
+    modelo sem cabeca (Qwen3Model: 'base_model.model.layers.N...'): as camadas LoRA sao criadas,
+    mas ficam com os pesos iniciais (lora_B = 0), e o modelo se comporta como o base sem avisar.
+    Isso afetava a avaliacao (Etapa 5) e a retomada do treino a partir de um checkpoint.
+
+    Exige que cada tensor do arquivo tenha destino no modelo, e cada camada LoRA do modelo tenha
+    um tensor no arquivo. Devolve quantos tensores foram copiados.
+    """
+    from safetensors.torch import load_file
+
+    arquivo = Path(pasta) / "adapter_model.safetensors"
+    estado = load_file(str(arquivo))
+    params = dict(auto_model.named_parameters())
+    try:
+        adaptador = auto_model.active_adapters()[0]
+    except Exception:
+        adaptador = "default"
+
+    destinos: dict[str, torch.Tensor] = {}
+    for chave, valor in estado.items():
+        nome = chave[len(PREFIXO_PEFT):] if chave.startswith(PREFIXO_PEFT) else chave
+        modulo, atributo = nome.rsplit(".", 1)  # 'layers.0.mlp.down_proj.lora_A', 'weight'
+        candidato = f"{modulo}.{adaptador}.{atributo}"
+        alternativas = (candidato, f"model.{candidato}", candidato.removeprefix("model."))
+        alvo = next((a for a in alternativas if a in params), None)
+        if alvo is None:
+            raise RuntimeError(f"Tensor '{chave}' de {arquivo} sem camada LoRA correspondente no modelo.")
+        if tuple(params[alvo].shape) != tuple(valor.shape):
+            raise RuntimeError(f"Formato diferente em '{alvo}': modelo {tuple(params[alvo].shape)}, arquivo {tuple(valor.shape)}.")
+        destinos[alvo] = valor
+
+    lora_no_modelo = {n for n in params if ".lora_" in n and f".{adaptador}." in n}
+    faltando = sorted(lora_no_modelo - destinos.keys())
+    if not destinos or faltando:
+        raise RuntimeError(
+            f"{len(faltando)} camadas LoRA do modelo sem peso em {arquivo} (ex.: {faltando[:2]}). "
+            "O adaptador nao corresponde a este modelo."
+        )
+
+    with torch.no_grad():
+        for alvo, valor in destinos.items():
+            params[alvo].copy_(valor.to(device=params[alvo].device, dtype=params[alvo].dtype))
+    return len(destinos)
 
 
 def _aplicar_lora(modelo: SentenceTransformer, cfg_lora: dict[str, Any], rank: str) -> None:

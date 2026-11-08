@@ -18,7 +18,26 @@ from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
 from sentence_transformers.trainer import SentenceTransformerTrainer
 from sentence_transformers.training_args import BatchSamplers, SentenceTransformerTrainingArguments
 
+from src.training.model_builder import carregar_pesos_lora
 from src.training.telemetry import ScientificMetricsCallback
+
+
+class _TreinadorComRetomadaLoRA(SentenceTransformerTrainer):
+    """
+    Retoma um checkpoint de LoRA copiando os pesos do adaptador direto para o modelo em treino.
+
+    O SentenceTransformerTrainer retoma recarregando o checkpoint como um SentenceTransformer novo.
+    Com LoRA, esse caminho passa pelo load_adapter do transformers 5.0, que nao aplica os pesos
+    salvos: o adaptador voltaria ao estado inicial, com o otimizador e o passo do checkpoint.
+    """
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, *args, **kwargs):
+        pasta = Path(resume_from_checkpoint)
+        if (pasta / "adapter_config.json").is_file():
+            n_tensores = carregar_pesos_lora(self.model[0].auto_model, pasta)
+            print(f"Adaptador LoRA retomado de {pasta.name}: {n_tensores} tensores copiados.")
+            return
+        super()._load_from_checkpoint(resume_from_checkpoint, *args, **kwargs)
 
 
 log = logging.getLogger("bumbalm_trainer")
@@ -348,7 +367,7 @@ def configurar_treinador(
 
     # 5. Trainer. Telemetria e gravacao de metricas ficam no processo 0.
     callbacks = [telemetry_callback] if _processo_principal() else []
-    trainer = SentenceTransformerTrainer(
+    trainer = _TreinadorComRetomadaLoRA(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
