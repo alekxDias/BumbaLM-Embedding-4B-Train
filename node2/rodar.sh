@@ -224,8 +224,8 @@ case "$MODO" in
         resumo_diagnostico 2>&1 | tee -a "$LOG" | tee "$DIAGNOSTICO/resumo.txt"
         ;;
     treinar)
-        # Ate dois checkpoints de ~48 GB (o melhor e o ultimo) mais um sendo gravado
-        exigir_espaco 110
+        # Ate dois checkpoints de ~48 GB (o melhor e o ultimo) e tres modelos finais de ~16 GB em fp32
+        exigir_espaco 145
         treinar ""
         ;;
     avaliar)
@@ -233,7 +233,7 @@ case "$MODO" in
         ;;
     completo)
         exigir_amostra
-        exigir_espaco 150
+        exigir_espaco 185
         checar 2>&1 | tee -a "$LOG"
         pipeline --steps split,chunk,mine,random --gpus 0,1
         treinar ""

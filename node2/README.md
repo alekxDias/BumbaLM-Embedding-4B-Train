@@ -103,7 +103,7 @@ O `rodar.sh` confere o espaço livre antes de começar e para com erro se faltar
 |---|---|---|
 | `amostra` | ~5 GB | ~2,5 GB de amostra em `Pares_Tribunais` |
 | `preparar` | ~50 GB | ~20 GB de dados (tuplas difíceis e aleatórias ~3,5 GB cada, vetores do corpus ~4,3 GB, chunks) |
-| `treinar` | ~110 GB | até 2 checkpoints de ~48 GB (pesos fp32 + Adam) + 3 modelos finais de ~8 GB (gravados em bf16) |
+| `treinar` | ~145 GB | até 2 checkpoints de ~48 GB (pesos fp32 + Adam) + 3 modelos finais de ~16 GB (gravados em fp32) |
 
 Ao fim de cada variante o script apaga os `checkpoint-*` e mantém o `best_model_4b`, que é o que a Etapa 5 avalia. Para mantê-los: `LIMPAR_CHECKPOINTS=0`. Se o disco apertar, a rodada de 60 mil pode sair depois do `testar_modelo`: `rm -rf data/processed_tjrs data/smoke_tjrs`.
 

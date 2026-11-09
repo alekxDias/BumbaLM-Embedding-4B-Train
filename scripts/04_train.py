@@ -588,10 +588,9 @@ def main() -> None:
         # Sem LoRA, load_best_model_at_end ja trouxe o melhor. Com LoRA, este e o ultimo passo.
         nome_final = "modelo_final" if usar_lora else "best_model_4b"
         best_model_path = dir_saida / nome_final
-        # Pesos em fp32 so servem ao otimizador. O modelo final vai em bf16 (~8 GB em vez de ~16 GB),
-        # a mesma precisao em que a Etapa 5 avalia.
-        if pesos_fp32 and not usar_lora and precisao_mista == "bf16":
-            modelo_salvar.to(torch.bfloat16)
+        # Com pesos em fp32 o modelo final tambem fica em fp32 (~16 GB). Em bf16, o passo do arredondamento
+        # nesses pesos (~6e-5) e maior que uma atualizacao do treino (~2e-5), e o modelo testado seria
+        # diferente do validado.
         modelo_salvar.save(str(best_model_path))
 
         melhor_ckpt = trainer.state.best_model_checkpoint

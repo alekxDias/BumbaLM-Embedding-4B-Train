@@ -63,9 +63,10 @@ treinamento:
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
 
-  # Frequencia de checkpoints e avaliacao. ~195 mil tuplas / 128 por passo = ~1.520 passos.
-  eval_steps: 200
-  save_steps: 200
+  # Frequencia de checkpoints e avaliacao. 174.037 tuplas / 128 por passo = ~1.360 passos.
+  # 136: 10 validacoes, a ultima no fim do treino (mesma proporcao do Colab).
+  eval_steps: 136
+  save_steps: 136
   # 1: fica o ultimo e o melhor. Com pesos em fp32, cada checkpoint (pesos + Adam) tem ~48 GB.
   save_total_limit: 1
   metric_for_best_model: "val_cosine_ndcg@10"
@@ -84,8 +85,8 @@ avaliacao:
   # O treino para se a validacao do passo 0 ficar abaixo disto: o modelo base passa de 0,5.
   # Um valor perto de zero indica modelo montado errado (foi o caso do diagnostico de 03/11/2026).
   mrr_minimo_passo0: 0.2
-  # Precisao dos pesos na Etapa 5.
-  precisao: "auto"
+  # Precisao dos pesos na Etapa 5. fp32: testa exatamente o modelo que foi validado no treino.
+  precisao: "fp32"
   metricas:
     - "ndcg@10"
     - "mrr@10"

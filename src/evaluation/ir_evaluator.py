@@ -33,6 +33,17 @@ from src.data.schema import ChunkProcesso, ProcessoJudicial
 log = logging.getLogger("bumbalm_ir_evaluator")
 
 
+def cos_sim_float32(a: Any, b: Any) -> Any:
+    """
+    Similaridade de cosseno em float32, mesmo com embeddings em bf16.
+
+    Com o modelo em bf16 a nota tambem saia em bf16, em degraus de ~0,004 acima de 0,5: de 21% a 35%
+    dos vizinhos do top 10 empatavam, e a ordem do empate nao vem da similaridade. Os vetores toleram
+    o bf16 porque os erros se cancelam nas dimensoes. A nota final, nao.
+    """
+    return cos_sim(a.float(), b.float())
+
+
 def carregar_processos_jsonl(caminho: Path | str) -> list[ProcessoJudicial]:
     """Le processos judiciais gravados em arquivo JSONL."""
     caminho_path = Path(caminho)
@@ -257,7 +268,7 @@ def criar_ir_evaluator(
         name=nome,
         batch_size=batch_size,
         show_progress_bar=show_progress_bar,
-        score_functions={"cosine": cos_sim},
+        score_functions={"cosine": cos_sim_float32},
         main_score_function="cosine",
         mrr_at_k=[10],
         ndcg_at_k=[10],
