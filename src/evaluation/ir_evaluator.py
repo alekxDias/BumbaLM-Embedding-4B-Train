@@ -282,6 +282,27 @@ def criar_ir_evaluator(
     return evaluator
 
 
+def protocolo_do_split(
+    caminho_processos: Path | str,
+    caminho_chunks: Path | str,
+    query_instruction: str,
+    excluir_chunks_contaminados: bool = True,
+) -> tuple[dict[str, Any], set[str]]:
+    """
+    Contagens do protocolo e ids das consultas do split, montados como em criar_ir_evaluator, sem
+    modelo e sem GPU. Servem para conferir um resultado gravado antes contra os dados atuais.
+    """
+    estatisticas: dict[str, Any] = {}
+    queries, _, _ = montar_estruturas_ir(
+        processos=carregar_processos_jsonl(caminho_processos),
+        chunks=carregar_chunks_jsonl(caminho_chunks),
+        query_instruction=query_instruction,
+        excluir_chunks_contaminados=excluir_chunks_contaminados,
+        estatisticas=estatisticas,
+    )
+    return estatisticas, set(queries)
+
+
 def formatar_metricas_ir(metricas: dict[str, float], prefixo_nome: str = "") -> dict[str, float]:
     """
     Normaliza os nomes das metricas retornadas pelo evaluator para um formato canonico.
@@ -408,6 +429,7 @@ def executar_avaliacao_completa(
     batch_size: int = 64,
     avaliar_por_tribunal: bool = True,
     gravar_por_consulta: bool = True,
+    configuracao: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """
     Executa a avaliacao de IR de ponta a ponta:
@@ -415,6 +437,9 @@ def executar_avaliacao_completa(
        por_consulta_<nome_avaliacao>.jsonl (uma linha por ementa) para testes de significancia.
     2. Avaliacoes segmentadas por tribunal (se habilitado).
     3. Gravacao de relatorio em texto formatado e arquivo JSON com as metricas.
+
+    configuracao (modelo, precisao, limite de tokens, instrucao) vai para o JSON como
+    configuracao_avaliacao: a Etapa 5 confere esses itens antes de reaproveitar o resultado.
     """
     if isinstance(model, (str, Path)):
         log.info("Carregando modelo SentenceTransformer a partir de: %s", model)
@@ -432,6 +457,8 @@ def executar_avaliacao_completa(
         "metricas_global": {},
         "metricas_por_tribunal": {},
     }
+    if configuracao:
+        relatorio_geral["configuracao_avaliacao"] = configuracao
 
     # 1. Avaliacao Global
     print(f"\nIniciando avaliacao global ({nome_avaliacao})...")

@@ -13,12 +13,15 @@ Executa:
    query_id em todos os modelos, para testes de significancia pareados feitos depois, sem GPU.
 
 Os modelos sao carregados um por vez, na precisao da GPU (fp16 na V100), e liberados em seguida.
+Para usar mais de uma placa, rode um processo por placa com --somente e --sem_comparativo, e depois
+um ultimo com --pular_avaliados, que so junta os resultados (node2/rodar.sh avaliar faz isso).
 
 Uso:
     python scripts/05_evaluate.py --compare_baseline
     python scripts/05_evaluate.py --compare_baseline --split both
     python scripts/05_evaluate.py --modelo dificeis=experiments/x/dificeis/checkpoint-1200 --compare_baseline
     python scripts/05_evaluate.py --model_path experiments/x/best_model_4b
+    CUDA_VISIBLE_DEVICES=1 python scripts/05_evaluate.py --compare_baseline --somente aleatorios --sem_comparativo
 """
 
 from __future__ import annotations
@@ -38,7 +41,7 @@ sys.path.insert(0, str(BASE_DIR))
 import torch
 from sentence_transformers import SentenceTransformer
 
-from src.evaluation.ir_evaluator import executar_avaliacao_completa
+from src.evaluation.ir_evaluator import executar_avaliacao_completa, protocolo_do_split
 from src.hardware import dtype_para_dispositivo
 from src.training.model_builder import carregar_pesos_lora
 
@@ -53,6 +56,8 @@ log = logging.getLogger("bumbalm_evaluate")
 ORDEM_VARIANTES = ["baseline", "nenhum", "aleatorios", "dificeis"]
 METRICAS_RELATORIO = ["ndcg@10", "mrr@10", "map@100", "accuracy@1", "accuracy@5", "accuracy@10",
                       "precision@10", "recall@10"]
+# Itens da configuracao que mudam o resultado. O lote fica de fora: so mexe no arredondamento.
+CONFIGURACAO_CONFERIDA = ("modelo", "precisao", "max_seq_length", "query_instruction")
 
 
 def carregar_yaml(caminho: Path) -> dict[str, Any]:
@@ -103,7 +108,27 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Reaproveita os modelos que ja tem metricas_<split>_<modelo>.json na pasta de saida. "
-            "Serve para retomar a avaliacao depois de uma queda (Colab) sem refazer os modelos prontos."
+            "Serve para retomar a avaliacao depois de uma queda sem refazer os modelos prontos. "
+            "Antes de usar, confere que o resultado e do mesmo teste (contagens e consultas) e, "
+            "quando registrados, do mesmo modelo, precisao, limite de tokens e instrucao."
+        ),
+    )
+    parser.add_argument(
+        "--somente",
+        type=str,
+        default=None,
+        metavar="NOMES",
+        help=(
+            "Avalia so estes modelos, separados por virgula ('baseline' e o modelo base de "
+            "--compare_baseline). Serve para dividir a avaliacao entre as placas."
+        ),
+    )
+    parser.add_argument(
+        "--sem_comparativo",
+        action="store_true",
+        help=(
+            "Grava so as metricas de cada modelo, sem comparativo_<split>.txt e avaliacao_consolidada.json. "
+            "Para processos em paralelo: o comparativo sai depois, numa chamada com --pular_avaliados."
         ),
     )
     parser.add_argument(
@@ -228,6 +253,72 @@ def carregar_modelo_avaliacao(caminho: str, max_seq_length: int, precisao: str =
     return modelo
 
 
+def conferir_reaproveitado(
+    resultado: dict[str, Any],
+    arq_metricas: Path,
+    protocolo_atual: dict[str, Any],
+    consultas_atuais: set[str],
+    configuracao_atual: dict[str, Any],
+) -> None:
+    """
+    Confere que um resultado gravado antes vale para esta avaliacao: mesmas contagens do split, mesmas
+    consultas e, nos itens registrados, mesma configuracao. Para em vez de juntar no comparativo numeros
+    de testes diferentes. Aponta arquivo_por_consulta para o arquivo ao lado das metricas.
+    """
+    problemas: list[str] = []
+    gravado = resultado.get("protocolo") or {}
+    for chave, valor in protocolo_atual.items():
+        if gravado.get(chave) != valor:
+            problemas.append(f"protocolo {chave}: gravado {gravado.get(chave)!r}, agora {valor!r}")
+
+    arq_consultas = arq_metricas.parent / f"por_consulta_{resultado.get('nome_avaliacao', '')}.jsonl"
+    if arq_consultas.is_file():
+        with arq_consultas.open(encoding="utf-8") as f:
+            ids = {json.loads(linha)["query_id"] for linha in f if linha.strip()}
+        if ids != consultas_atuais:
+            problemas.append(
+                f"consultas: {len(ids)} em {arq_consultas.name} e {len(consultas_atuais)} no split, "
+                f"{len(ids ^ consultas_atuais)} diferentes"
+            )
+        resultado["arquivo_por_consulta"] = str(arq_consultas)
+    else:
+        print(f"  - Nota: sem {arq_consultas.name}; este modelo fica fora dos testes pareados.")
+
+    configuracao = resultado.get("configuracao_avaliacao") or {}
+    nao_registrados = [c for c in CONFIGURACAO_CONFERIDA if c not in configuracao]
+    for chave in CONFIGURACAO_CONFERIDA:
+        if chave in configuracao and configuracao[chave] != configuracao_atual.get(chave):
+            problemas.append(f"{chave}: gravado {configuracao[chave]!r}, agora {configuracao_atual.get(chave)!r}")
+
+    if problemas:
+        raise RuntimeError(
+            f"O resultado em {arq_metricas} nao vale para esta avaliacao:\n  - "
+            + "\n  - ".join(problemas)
+            + f"\nApague {arq_metricas.parent} para medir esse modelo de novo."
+        )
+    origem = f" (registro: {configuracao['fonte']})" if configuracao.get("fonte") else ""
+    print(f"  - Conferido: mesmo protocolo e mesmas {len(consultas_atuais):,} consultas{origem}.")
+    if nao_registrados:
+        print(f"  - Nota: o resultado nao registra {', '.join(nao_registrados)}; esses itens nao foram conferidos.")
+
+
+def configuracao_avaliacao(
+    caminho_modelo: str,
+    precisao: str,
+    max_seq_length: int,
+    query_instruction: str,
+    batch_size: int,
+) -> dict[str, Any]:
+    """O que fica gravado em configuracao_avaliacao e e conferido antes de reaproveitar o resultado."""
+    return {
+        "modelo": caminho_modelo,
+        "precisao": precisao,
+        "max_seq_length": max_seq_length,
+        "query_instruction": query_instruction,
+        "batch_size": batch_size,
+    }
+
+
 def _ordenar_nomes(nomes: list[str]) -> list[str]:
     conhecidos = [n for n in ORDEM_VARIANTES if n in nomes]
     return conhecidos + sorted(n for n in nomes if n not in ORDEM_VARIANTES)
@@ -302,6 +393,15 @@ def main() -> None:
     if args.compare_baseline:
         modelos = {"baseline": baseline_id, **modelos}
 
+    if args.somente:
+        pedidos = [n.strip() for n in args.somente.split(",") if n.strip()]
+        faltando = [n for n in pedidos if n not in modelos]
+        if faltando:
+            raise ValueError(
+                f"--somente pediu {', '.join(faltando)}, mas os modelos encontrados sao: {', '.join(modelos) or 'nenhum'}."
+            )
+        modelos = {n: c for n, c in modelos.items() if n in pedidos}
+
     if not modelos:
         raise FileNotFoundError(
             f"Nenhum modelo para avaliar em {dir_experimento}.\n"
@@ -347,18 +447,33 @@ def main() -> None:
         else:
             log.warning("Arquivos para o split '%s' nao encontrados em %s. Pulando...", split_nome, dir_processados)
 
+    # Contagens e consultas de cada split, montadas sem GPU uma vez, para conferir resultados reaproveitados
+    protocolos: dict[str, tuple[dict[str, Any], set[str]]] = {}
+
+    def protocolo_de(split_nome: str) -> tuple[dict[str, Any], set[str]]:
+        if split_nome not in protocolos:
+            arq_processos, arq_chunks = arquivos_split[split_nome]
+            protocolos[split_nome] = protocolo_do_split(arq_processos, arq_chunks, query_instruction)
+        return protocolos[split_nome]
+
     # Um modelo por vez na GPU: dois 4B em fp16 nao cabem com folga em 32 GB
     resultados: dict[str, dict[str, Any]] = {split: {} for split in arquivos_split}
+    reaproveitados: dict[str, list[str]] = {}
     for nome, caminho in modelos.items():
+        configuracao = configuracao_avaliacao(caminho, precisao, max_seq_length, query_instruction, args.batch_size)
         if args.pular_avaliados:
             prontos = {
                 split_nome: dir_saida / split_nome / nome / f"metricas_{split_nome}_{nome}.json"
                 for split_nome in arquivos_split
             }
             if prontos and all(p.is_file() for p in prontos.values()):
-                for split_nome, p in prontos.items():
-                    resultados[split_nome][nome] = json.loads(p.read_text(encoding="utf-8"))
                 print(f"\nModelo '{nome}' ja avaliado: metricas lidas de {dir_saida}")
+                for split_nome, p in prontos.items():
+                    resultado = json.loads(p.read_text(encoding="utf-8"))
+                    protocolo_atual, consultas_atuais = protocolo_de(split_nome)
+                    conferir_reaproveitado(resultado, p, protocolo_atual, consultas_atuais, configuracao)
+                    resultados[split_nome][nome] = resultado
+                reaproveitados[nome] = [str(p) for p in prontos.values()]
                 continue
         print(f"\nCarregando modelo '{nome}': {caminho} ...")
         modelo = carregar_modelo_avaliacao(caminho, max_seq_length, precisao)
@@ -374,13 +489,21 @@ def main() -> None:
                 excluir_chunks_contaminados=True,
                 batch_size=args.batch_size,
                 avaliar_por_tribunal=True,
+                configuracao=configuracao,
             )
         del modelo
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    relatorio_consolidado_geral: dict[str, Any] = {"modelos": modelos, "splits": {}}
+    if args.sem_comparativo:
+        print("=" * 64)
+        print(f"Metricas de {', '.join(modelos)} gravadas em {dir_saida}.")
+        print("Comparativo nao gerado (--sem_comparativo): rode de novo com --pular_avaliados para junta-los.")
+        print("=" * 64)
+        return
+
+    relatorio_consolidado_geral: dict[str, Any] = {"modelos": modelos, "reaproveitados": reaproveitados, "splits": {}}
     for split_nome, por_modelo in resultados.items():
         caminho_relatorio_txt = dir_saida / f"comparativo_{split_nome}.txt"
         gerar_relatorio_comparativo(
