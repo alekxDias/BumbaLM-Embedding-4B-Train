@@ -34,8 +34,9 @@ Permite executar o pipeline completo de ponta a ponta ou etapas especificas:
 7. Apenas treinamento contrastivo com parametros customizados:
    python scripts/run_pipeline.py --steps train --batch_size 96 --epochs 2 --lr 1.5e-5
 
-7b. Treino nas duas GPUs (DDP, lote de 64 por placa):
+7b. Treino nas duas GPUs (DDP; o lote do passo, 128, fica 64 por placa) ou numa so (128 nela):
    python scripts/run_pipeline.py --steps train --gpus 0,1
+   python scripts/run_pipeline.py --steps train --gpus 1
 
 7c. Mineracao nas duas GPUs (vetorizacao e busca repartidas; nao usa torchrun):
    python scripts/run_pipeline.py --steps mine --gpus 0,1

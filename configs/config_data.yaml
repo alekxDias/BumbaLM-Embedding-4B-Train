@@ -52,7 +52,7 @@ mineracao_negativos:
   # com a consulta. O teto fixo de 0.85 deixava passar negativos acima de positivos fracos
   # (70% das tuplas no smoke do TJRS). Vale tambem para os negativos aleatorios. null desliga.
   max_relativo_positivo: 0.95
-  top_k_candidatos: 200
+  top_k_candidatos: 500  # o minerador busca o dobro: 1.000 candidatos por consulta
   
   # Lotes de mineracao acelerada em GPU
   # 256 na H200 (como na main). Na V100 de 32 GB era 32: la 64 ja estourava a memoria.

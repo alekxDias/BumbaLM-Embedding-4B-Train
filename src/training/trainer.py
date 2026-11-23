@@ -17,9 +17,61 @@ from sentence_transformers import SentenceTransformer
 from sentence_transformers.losses import CachedMultipleNegativesRankingLoss
 from sentence_transformers.trainer import SentenceTransformerTrainer
 from sentence_transformers.training_args import BatchSamplers, SentenceTransformerTrainingArguments
+from transformers import TrainerCallback
 
 from src.training.model_builder import carregar_pesos_lora
 from src.training.telemetry import ScientificMetricsCallback
+
+
+def _estrategia(valor: Any) -> str:
+    """'no', 'steps', 'epoch' ou 'best', venha a estrategia do Trainer como enum ou como texto."""
+    return str(getattr(valor, "value", valor)).lower()
+
+
+class ValidarUltimoPassoCallback(TrainerCallback):
+    """
+    Valida e grava checkpoint no ultimo passo do treino quando ele nao cai num multiplo de eval_steps.
+
+    O total de passos vem do tamanho do sorteador sem duplicatas, mas no fim ele descarta as tuplas que
+    nao completam um lote sem repetir texto, e o treino pode parar antes do previsto. No smoke de
+    09/11/2026 foram 4 passos de 5: nenhuma validacao, nenhum checkpoint, e a trava do melhor checkpoint
+    nao teve o que conferir. No full, o passo final (1.774) tambem nao e multiplo de eval_steps (197).
+    Com este callback o modelo final sempre e validado e concorre a melhor checkpoint.
+
+    Fica em todos os processos: a decisao depende so do passo, que e o mesmo nas duas GPUs.
+    """
+
+    def __init__(self) -> None:
+        self.ultimo_passo_validado = -1
+        self.ultimo_passo_salvo = -1
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        self.ultimo_passo_validado = state.global_step
+
+    def on_save(self, args, state, control, **kwargs):
+        self.ultimo_passo_salvo = state.global_step
+
+    def _fechar_treino(self, args, state, control):
+        passo = state.global_step
+        if passo <= 0:
+            return control
+        validar = _estrategia(args.eval_strategy) != "no" and self.ultimo_passo_validado != passo
+        if validar:
+            control.should_evaluate = True
+        # Depois de uma validacao nova o checkpoint e gravado de novo: e no salvamento que o
+        # Trainer registra qual checkpoint e o melhor.
+        if _estrategia(args.save_strategy) in ("steps", "epoch") and (validar or self.ultimo_passo_salvo != passo):
+            control.should_save = True
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step >= state.max_steps:
+            return self._fechar_treino(args, state, control)
+        return control
+
+    def on_epoch_end(self, args, state, control, **kwargs):
+        # Com 1 epoca, e o fim do treino, mesmo quando o sorteador acabou antes de max_steps
+        return self._fechar_treino(args, state, control)
 
 
 class _TreinadorComRetomadaLoRA(SentenceTransformerTrainer):
@@ -356,6 +408,10 @@ def configurar_treinador(
         dataloader_pin_memory=dataloader_pin_memory,
         remove_unused_columns=False,
         batch_sampler=BatchSamplers.NO_DUPLICATES,
+        # Descarta o ultimo lote incompleto (227.076 tuplas / 128 = 1.774 lotes e sobram 4). No DDP o
+        # Sentence Transformers ja liga isto sozinho; numa placa so viraria um 1.775o passo com 4 tuplas,
+        # e as variantes deixariam de ter o mesmo numero de passos e a mesma curva do LR.
+        dataloader_drop_last=True,
         seed=seed,
     )
 
@@ -366,7 +422,10 @@ def configurar_treinador(
     )
 
     # 5. Trainer. Telemetria e gravacao de metricas ficam no processo 0.
-    callbacks = [telemetry_callback] if _processo_principal() else []
+    # A validacao do ultimo passo vale para todos os processos, senao as GPUs se desencontram.
+    callbacks = [ValidarUltimoPassoCallback()]
+    if _processo_principal():
+        callbacks.append(telemetry_callback)
     trainer = _TreinadorComRetomadaLoRA(
         model=model,
         args=training_args,

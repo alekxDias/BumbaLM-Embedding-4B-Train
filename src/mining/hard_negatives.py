@@ -920,7 +920,7 @@ def minerar_tripletos_contrastivos(
         corpus_embs_gpu = torch.from_numpy(corpus_embs_cpu).to(device=device, dtype=dtype_tensor)
 
     soma_margens = 0.0
-    # top_k do YAML e 200; busca o dobro para a faixa 0.60-0.85 ainda ter 5 negativos.
+    # Busca o dobro do top_k do YAML para a faixa 0.60-0.85 ainda ter 5 negativos.
     k_candidatos_gpu = min(max(top_k * 2, n_negativos * 10), total_chunks)
 
     # 3. Processamento em lote das consultas. Append preserva o que ja estava no disco.

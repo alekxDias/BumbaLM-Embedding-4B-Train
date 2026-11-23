@@ -32,6 +32,7 @@ import os
 import argparse
 import json
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -41,6 +42,27 @@ from typing import Any
 # Adiciona a raiz do repositorio ao PYTHONPATH
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
+
+
+def _gpus_da_linha_de_comando(argv: list[str]) -> str | None:
+    for indice, arg in enumerate(argv):
+        if arg == "--gpus" and indice + 1 < len(argv):
+            return argv[indice + 1]
+        if arg.startswith("--gpus="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+# Uma placa so: fixa a GPU antes de importar o torch. O transformers/accelerate ja consulta o CUDA na
+# importacao, e o driver le CUDA_VISIBLE_DEVICES uma vez so. Fixada depois (como o _preparar_gpus faz),
+# o processo continuava vendo as duas placas e o Trainer ligava o DataParallel: lote do passo em dobro
+# (256, 888 passos) e ~12x mais lento (17/11/2026). Com duas placas, o DDP relanca o script e cada
+# processo ja nasce com a variavel certa.
+_GPUS_PEDIDAS = _gpus_da_linha_de_comando(sys.argv[1:])
+if _GPUS_PEDIDAS is not None and os.environ.get("LOCAL_RANK") is None:
+    _ids_pedidos = [parte.strip() for parte in _GPUS_PEDIDAS.split(",") if parte.strip()]
+    if len(_ids_pedidos) == 1:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _ids_pedidos[0]
 
 import torch
 import transformers.utils.import_utils as _tf_import_utils
@@ -74,7 +96,7 @@ if hasattr(_tf_trainer.Trainer, "_load_rng_state"):
             print(f"[Aviso] Nao foi possivel restaurar rng_state ({exc}). O treinamento continuara com novo estado de RNG.")
     _tf_trainer.Trainer._load_rng_state = _safe_load_rng_state
 
-from src.training.model_builder import construir_modelo_embedding
+from src.training.model_builder import carregar_pesos_checkpoint_completo, construir_modelo_embedding
 from src.training.trainer import (
     carregar_dataset_tripletos,
     configurar_treinador,
@@ -212,6 +234,76 @@ def _dispositivo_local() -> str:
     return f"cuda:{local_rank}"
 
 
+def _lote_por_gpu(batch_cli: int | None, train_cfg: dict[str, Any], num_processos: int) -> int:
+    """
+    Lote de cada GPU. lote_por_passo e o lote contrastivo do passo somando as placas: 128 da 64 em
+    cada uma de duas placas (com gather_across_devices os candidatos sao juntados) ou 128 numa so.
+    Assim a perda e a mesma com uma ou duas GPUs. --batch_size (por GPU) e batch_size_train
+    (configs antigos) continuam valendo.
+    """
+    if batch_cli:
+        return int(batch_cli)
+    lote_passo = train_cfg.get("lote_por_passo")
+    if not lote_passo:
+        return int(train_cfg.get("batch_size_train", 64))
+    lote_passo = int(lote_passo)
+    if lote_passo % num_processos:
+        raise ValueError(f"lote_por_passo ({lote_passo}) nao se divide igualmente entre {num_processos} GPUs.")
+    return lote_passo // num_processos
+
+
+def _resolver_retomada(valor: str | None, dir_saida: Path) -> bool | str | None:
+    """True retoma do ultimo checkpoint de dir_saida; um caminho retoma daquele checkpoint."""
+    if valor is None:
+        return None
+    if str(valor).strip().lower() in ("true", "auto", "1"):
+        return True
+    caminho = Path(valor)
+    if not caminho.is_absolute():
+        if (dir_saida / caminho).exists():
+            caminho = dir_saida / caminho
+        elif (BASE_DIR / caminho).exists():
+            caminho = BASE_DIR / caminho
+    return str(caminho)
+
+
+def _checkpoint_da_retomada(resume: bool | str | None, dir_saida: Path) -> Path | None:
+    """O checkpoint que o Trainer vai carregar: o de maior passo (como o get_last_checkpoint) ou o caminho dado."""
+    if not resume:
+        return None
+    if resume is not True:
+        return Path(resume)
+    passos = []
+    for pasta in dir_saida.glob("checkpoint-*"):
+        achado = re.fullmatch(r"checkpoint-(\d+)", pasta.name)
+        if achado and pasta.is_dir():
+            passos.append((int(achado.group(1)), pasta))
+    return max(passos)[1] if passos else None
+
+
+def _conferir_lote_do_checkpoint(checkpoint: Path | None, lote_por_gpu: int, num_processos: int) -> None:
+    """
+    Para a retomada quando o checkpoint foi gravado com outro lote por GPU. Acontece ao trocar o numero de
+    placas no meio de uma variante (64 por GPU nas duas, 128 numa so). O Trainer troca o lote pelo do
+    checkpoint (train_batch_size do trainer_state.json), a ordem dos lotes nao bate com a ja treinada e o
+    estado aleatorio de cada placa se perde: a variante deixaria de ser comparavel com as outras.
+    """
+    if checkpoint is None:
+        return
+    arq_estado = checkpoint / "trainer_state.json"
+    if not arq_estado.is_file():
+        return
+    gravado = json.loads(arq_estado.read_text(encoding="utf-8")).get("train_batch_size")
+    if gravado is None or int(gravado) == lote_por_gpu:
+        return
+    _imprimir(
+        f"ERRO: {checkpoint.name} foi gravado com lote de {gravado} por GPU, e agora o lote seria "
+        f"{lote_por_gpu} por GPU ({num_processos} GPU(s)). Retome com o mesmo numero de GPUs do checkpoint "
+        f"ou apague {checkpoint.parent} para recomecar esta variante do zero."
+    )
+    sys.exit(3)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -264,7 +356,7 @@ def parse_args() -> argparse.Namespace:
         "--batch_size",
         type=int,
         default=None,
-        help="Sobrescreve o batch_size_train configurado no YAML.",
+        help="Lote por GPU. Sobrescreve o lote_por_passo (ou batch_size_train) do YAML.",
     )
     parser.add_argument(
         "--epochs",
@@ -389,7 +481,8 @@ def main() -> None:
 
     # Parametros de treino
     train_cfg = cfg_train.get("treinamento", {})
-    batch_size = args.batch_size or train_cfg.get("batch_size_train", 64)
+    num_processos = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+    batch_size = _lote_por_gpu(args.batch_size, train_cfg, num_processos)
     mini_batch_size = args.mini_batch_size or train_cfg.get("mini_batch_size", 32)
     grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
     lr = args.lr or train_cfg.get("learning_rate", 2.0e-5)
@@ -411,8 +504,11 @@ def main() -> None:
     save_steps = train_cfg.get("save_steps", 250)
     loss_scale = cfg_train.get("loss", {}).get("scale", 50.0)
 
+    # Antes de carregar o modelo: uma retomada com outro numero de GPUs para aqui
+    resume = _resolver_retomada(args.resume_from_checkpoint, dir_saida)
+    _conferir_lote_do_checkpoint(_checkpoint_da_retomada(resume, dir_saida), batch_size, num_processos)
+
     dispositivo = _dispositivo_local()
-    num_processos = max(1, int(os.environ.get("WORLD_SIZE", "1")))
 
     # bf16 na A100/H200; fp16 na V100. O Trainer usa a mesma escolha na precisao mista.
     dtype_alvo = dtype_para_dispositivo(dispositivo, precisao)
@@ -426,7 +522,7 @@ def main() -> None:
     _imprimir(f"Diretorio de Saida   : {dir_saida}")
     _imprimir(f"Modelo de Base       : {model_id}")
     _imprimir(f"GPUs no passo        : {num_processos} | Dispositivo local: {dispositivo}")
-    _imprimir(f"Batch por GPU        : {batch_size} (Acumulacao: {grad_accum})")
+    _imprimir(f"Lote do passo        : {batch_size * num_processos} ({batch_size} por GPU, acumulacao: {grad_accum})")
     _imprimir(f"Taxa de Aprendizado  : {lr} | Epocas: {epochs}")
     _imprimir(f"Precisao mista       : {precisao_mista} | Atencao: {attn_impl}")
     _imprimir(f"LoRA                 : {usar_lora} | Limite de tuplas: {limite_tuplas or 'todas'}")
@@ -549,20 +645,17 @@ def main() -> None:
         seed=seed,
     )
 
-    # 4. Execucao do Fine-Tuning
-    resume = args.resume_from_checkpoint
-    if resume is not None:
-        if str(resume).strip().lower() in ("true", "auto", "1"):
-            resume = True
-        else:
-            p_resume = Path(resume)
-            if not p_resume.is_absolute():
-                if (dir_saida / p_resume).exists():
-                    p_resume = dir_saida / p_resume
-                elif (BASE_DIR / p_resume).exists():
-                    p_resume = BASE_DIR / p_resume
-            resume = str(p_resume)
+    # Num processo so, o Trainer usa DataParallel quando enxerga mais de uma GPU: o lote do passo dobra e
+    # o modelo e copiado para a outra placa a cada mini-lote. O experimento so usa DDP ou uma placa.
+    if trainer.args.n_gpu > 1:
+        _imprimir(
+            f"ERRO: este processo enxerga {trainer.args.n_gpu} GPUs e o Trainer usaria DataParallel "
+            f"(lote do passo {batch_size * trainer.args.n_gpu} em vez de {batch_size * num_processos}). "
+            "Rode pelo node2/rodar.sh com GPUS=<placa> ou passe --gpus <placa>."
+        )
+        sys.exit(4)
 
+    # 4. Execucao do Fine-Tuning (resume ja resolvido e conferido antes de carregar o modelo)
     _imprimir("-" * 64)
     if resume:
         _imprimir(f"Retomando treinamento a partir do checkpoint: {resume}")
@@ -585,7 +678,21 @@ def main() -> None:
     # 5. Salvamento do Modelo Final (somente o processo da primeira GPU)
     if _processo_principal():
         modelo_salvar = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
-        # Sem LoRA, load_best_model_at_end ja trouxe o melhor. Com LoRA, este e o ultimo passo.
+        melhor_ckpt = trainer.state.best_model_checkpoint
+        tensores_conferidos = None
+        # A biblioteca so registra o erro se nao carregar o melhor checkpoint. Aqui a copia e conferida,
+        # e uma falha interrompe antes de o rodar.sh apagar o checkpoint.
+        if melhor_ckpt and not usar_lora:
+            tensores_conferidos, tensores_diferentes = carregar_pesos_checkpoint_completo(
+                modelo_salvar[0].auto_model, melhor_ckpt
+            )
+            print(f"Melhor checkpoint conferido: {Path(melhor_ckpt).name} | {tensores_conferidos:,} tensores")
+            if tensores_diferentes:
+                print(
+                    f"AVISO: {tensores_diferentes:,} tensores ainda nao eram os do melhor checkpoint e foram copiados. "
+                    "O carregamento da biblioteca falhou: veja o log."
+                )
+        # Sem LoRA, o modelo em memoria e o melhor checkpoint. Com LoRA, este e o ultimo passo.
         nome_final = "modelo_final" if usar_lora else "best_model_4b"
         best_model_path = dir_saida / nome_final
         # Com pesos em fp32 o modelo final tambem fica em fp32 (~16 GB). Em bf16, o passo do arredondamento
@@ -593,7 +700,6 @@ def main() -> None:
         # diferente do validado.
         modelo_salvar.save(str(best_model_path))
 
-        melhor_ckpt = trainer.state.best_model_checkpoint
         registro = {
             "variante_negativos": args.negativos,
             "n_negativos": n_negativos,
@@ -609,6 +715,7 @@ def main() -> None:
             "metrica_selecao": metric_best,
             "melhor_metrica": trainer.state.best_metric,
             "melhor_checkpoint": melhor_ckpt,
+            "tensores_conferidos_melhor_checkpoint": tensores_conferidos,
             "modelo_final": str(best_model_path),
             # A Etapa 5 avalia este caminho.
             "modelo_para_avaliar": str(melhor_ckpt) if (usar_lora and melhor_ckpt) else str(best_model_path),

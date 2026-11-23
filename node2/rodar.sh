@@ -9,11 +9,13 @@
 #   bash node2/rodar.sh minerar     # so mineracao e aleatorios (retoma o preparar interrompido na mineracao)
 #   bash node2/rodar.sh diagnostico # depois do preparar: base no teste completo + 1 treino curto (~1,5 h)
 #   bash node2/rodar.sh treinar     # as tres variantes, uma de cada vez
-#   bash node2/rodar.sh avaliar     # teste completo das variantes e do modelo base
+#   bash node2/rodar.sh avaliar     # teste completo: base do diagnostico + variantes, uma fila por placa (~8 h nas duas)
 #   bash node2/rodar.sh completo    # preparar + treinar + avaliar
 #
 # Variaveis opcionais: VARIANTES="nenhum,aleatorios,dificeis", LIMITE_TUPLAS=100000 (padrao: todas),
-# LIMPAR_CHECKPOINTS=0 (mantem os checkpoint-* depois de cada variante).
+# LIMPAR_CHECKPOINTS=0 (mantem os checkpoint-* depois de cada variante),
+# GPUS="1" (placas usadas; padrao "0,1"). O lote do passo (lote_por_passo em configs/config_train.yaml)
+# e o mesmo com uma ou duas placas: numa so, cada passo leva ~2x mais tempo.
 # Se o processo cair, rode o mesmo comando de novo: a mineracao retoma do ultimo bloco, o treino
 # retoma do ultimo checkpoint e as variantes ja concluidas sao puladas.
 
@@ -24,6 +26,12 @@ source node2/env.sh
 MODO="${1:-}"
 VARIANTES="${VARIANTES:-nenhum,aleatorios,dificeis}"
 LIMPAR_CHECKPOINTS="${LIMPAR_CHECKPOINTS:-1}"
+GPUS="${GPUS:-0,1}"
+GPUS="${GPUS// /}"
+IFS=',' read -ra PLACAS <<< "$GPUS"
+# Todo processo lancado daqui so enxerga as placas de GPUS. Com uma placa visivel a mais, o Trainer
+# ligava o DataParallel (lote em dobro e treino ~12x mais lento). A avaliacao troca por placa abaixo.
+export CUDA_VISIBLE_DEVICES="$GPUS"
 # Precisa bater com dados.arquivos_pares de configs/config_base.yaml
 AMOSTRA_N=100000
 AMOSTRA="$PARES_DIR/pares_tjrs_amostra$((AMOSTRA_N / 1000))k.jsonl"
@@ -37,6 +45,7 @@ if [ "$MODO" = "smoke" ]; then
     CONFIG_BASE="configs/config_base_smoke.yaml"
     EXPERIMENTO="experiments/smoke_tjrs_h200"
 fi
+AVALIACOES="$EXPERIMENTO/avaliacoes"
 
 LOG="logs/node2_${MODO:-ajuda}_$(date +%Y%m%d_%H%M%S).log"
 
@@ -120,7 +129,7 @@ treinar() {
             echo "Checkpoint encontrado em $pasta: retomando." | tee -a "$LOG"
             extra+=(--resume_from_checkpoint auto)
         fi
-        pipeline --steps train --negativos "$variante" --gpus 0,1 "${extra[@]}"
+        pipeline --steps train --negativos "$variante" --gpus "$GPUS" "${extra[@]}"
         limpar_checkpoints "$pasta"
     done
 }
@@ -139,7 +148,7 @@ diagnostico_treino() {
         return 0
     fi
     # Com avaliar_no_inicio e mrr_minimo_passo0, um modelo que ja comeca quebrado para no passo 0
-    python -u scripts/04_train.py --negativos nenhum --gpus 0,1 --diagnostico \
+    python -u scripts/04_train.py --negativos nenhum --gpus "$GPUS" --diagnostico \
         --limite_tuplas "$DIAG_TUPLAS" --eval_steps 5 --warmup_ratio 0.1 \
         --output_dir "$DIAGNOSTICO/$nome" "$@" 2>&1 | tee -a "$LOG"
 }
@@ -164,6 +173,118 @@ for arq in sorted(raiz.glob("*/metricas_treino_val.csv")):
 EOF
 }
 
+# O diagnostico ja mediu o modelo base no mesmo split de teste (~4 h em fp32). Medir de novo daria o
+# mesmo numero. Copia o resultado e grava nele a configuracao lida do log do diagnostico (modelo,
+# precisao, tokens, lote) e do relatorio (instrucao), conferindo que e a mesma de agora. A Etapa 5
+# ainda confere as contagens do split e as 9.999 consultas antes de usar.
+reaproveitar_base() {
+    local origem="$DIAGNOSTICO/base_teste/test/baseline" destino="$AVALIACOES/test/baseline"
+    [ -f "$destino/metricas_test_baseline.json" ] && return 0
+    if [ ! -f "$origem/metricas_test_baseline.json" ]; then
+        echo "Sem o base do diagnostico em $origem: o base sera medido junto com as variantes." | tee -a "$LOG"
+        return 0
+    fi
+    mkdir -p "$destino"
+    cp "$origem"/* "$destino"/
+    if ! python - "$origem" "$destino/metricas_test_baseline.json" <<'EOF' 2>&1 | tee -a "$LOG"; then
+import json, re, sys
+from pathlib import Path
+
+import yaml
+
+origem, arq = Path(sys.argv[1]), Path(sys.argv[2])
+saida = origem.parent.parent.as_posix()  # .../base_teste, o "Diretorio de Saida" do log do diagnostico
+cfg = yaml.safe_load(open("configs/config_train.yaml", encoding="utf-8"))
+agora = {
+    "modelo": cfg["modelo"]["model_id"],
+    "precisao": str(cfg.get("avaliacao", {}).get("precisao", "auto")),
+    "max_seq_length": int(cfg["modelo"]["max_seq_length"]),
+}
+
+registro = None
+for log in sorted(Path("logs").glob("node2_diagnostico_*.log")):
+    texto = log.read_text(encoding="utf-8", errors="replace")
+    linhas_saida = [l for l in texto.splitlines() if l.startswith("Diretorio de Saida")]
+    if not any(l.split(":", 1)[1].strip().endswith(saida) for l in linhas_saida):
+        continue
+    modelo = re.search(r"^Modelo baseline\s*:\s*(\S+)", texto, re.M)
+    lote = re.search(r"Batch Size Avaliacao : (\d+) \| Max tokens: (\d+) \| Precisao: (\w+)", texto)
+    if modelo and lote:
+        registro = {
+            "modelo": modelo.group(1),
+            "precisao": lote.group(3),
+            "max_seq_length": int(lote.group(2)),
+            "batch_size": int(lote.group(1)),
+            "fonte": f"{log} (resultado copiado de {origem})",
+        }
+if registro is None:
+    sys.exit(f"Base: nao achei em logs/ o log do diagnostico com a configuracao de {saida}.")
+
+diferencas = [f"{k}: diagnostico {registro[k]!r}, agora {v!r}" for k, v in agora.items() if registro[k] != v]
+relatorio = (origem / "relatorio_test_baseline.txt").read_text(encoding="utf-8")
+instrucao = re.search(r"Instrucao de Query\s*: (.*?)\n\n", relatorio, re.S)
+instrucao_agora = cfg["modelo"]["query_instruction"]
+if not instrucao or instrucao.group(1).strip() != instrucao_agora.strip():
+    diferencas.append("instrucao da consulta diferente da do config_train.yaml")
+if diferencas:
+    sys.exit("Base: o diagnostico usou outra configuracao (" + "; ".join(diferencas) + ").")
+
+registro["query_instruction"] = instrucao_agora
+dados = json.loads(arq.read_text(encoding="utf-8"))
+dados["configuracao_avaliacao"] = registro
+arq.write_text(json.dumps(dados, indent=2, ensure_ascii=False), encoding="utf-8")
+print(f"Base: reaproveitado o resultado do diagnostico ({registro['modelo']}, {registro['precisao']}, "
+      f"{registro['max_seq_length']} tokens), conforme {registro['fonte']}.")
+EOF
+        rm -rf "$destino"
+        echo "O base sera medido junto com as variantes." | tee -a "$LOG"
+    fi
+}
+
+# Etapa 5 no teste completo. A fila (o base, se nao veio do diagnostico, e as variantes concluidas)
+# e dividida entre as placas de GPUS, um modelo por vez em cada uma, em fp32 (~4 h por modelo).
+# Com o base reaproveitado e duas placas: ~8 h; com uma placa: ~13 h. No fim, uma chamada junta
+# tudo no comparativo sem carregar modelo. Se cair, rode de novo: o que ficou pronto e pulado.
+avaliar_teste() {
+    local fila=() todos=(baseline) por_placa=() pids=() v i p log_placa nomes falhou=0
+    [ "$MODO" = "smoke" ] || reaproveitar_base
+    [ -f "$AVALIACOES/test/baseline/metricas_test_baseline.json" ] || fila+=(baseline)
+    IFS=',' read -ra lista <<< "$VARIANTES"
+    for v in "${lista[@]}"; do
+        if [ ! -f "$EXPERIMENTO/$v/melhor_checkpoint.json" ]; then
+            echo "Variante '$v' sem $EXPERIMENTO/$v/melhor_checkpoint.json: fica fora da avaliacao." | tee -a "$LOG"
+            continue
+        fi
+        todos+=("$v")
+        [ -f "$AVALIACOES/test/$v/metricas_test_$v.json" ] || fila+=("$v")
+    done
+    for i in "${!fila[@]}"; do
+        p=$((i % ${#PLACAS[@]}))
+        por_placa[$p]="${por_placa[$p]:+${por_placa[$p]},}${fila[$i]}"
+    done
+    for p in "${!PLACAS[@]}"; do
+        [ -n "${por_placa[$p]:-}" ] || continue
+        log_placa="${LOG%.log}_placa${PLACAS[$p]}.log"
+        echo "Placa ${PLACAS[$p]}: ${por_placa[$p]} | acompanhe com: tail -f $log_placa" | tee -a "$LOG"
+        CUDA_VISIBLE_DEVICES="${PLACAS[$p]}" python -u scripts/05_evaluate.py --config_base "$CONFIG_BASE" --split test \
+            --experimento_dir "$EXPERIMENTO" --output_dir "$AVALIACOES" --compare_baseline \
+            --somente "${por_placa[$p]}" --pular_avaliados --sem_comparativo > "$log_placa" 2>&1 &
+        pids+=($!)
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || falhou=1
+    done
+    if [ "$falhou" = 1 ]; then
+        echo "ERRO: a avaliacao falhou em uma das placas (veja ${LOG%.log}_placa*.log)." | tee -a "$LOG"
+        echo "Rode o mesmo comando de novo: os modelos ja avaliados sao pulados." | tee -a "$LOG"
+        exit 1
+    fi
+    nomes="$(IFS=,; echo "${todos[*]}")"
+    python -u scripts/05_evaluate.py --config_base "$CONFIG_BASE" --split test \
+        --experimento_dir "$EXPERIMENTO" --output_dir "$AVALIACOES" --compare_baseline \
+        --somente "$nomes" --pular_avaliados 2>&1 | tee -a "$LOG"
+}
+
 echo "node2/rodar.sh $MODO | $(hostname) | $(date)" | tee -a "$LOG"
 
 case "$MODO" in
@@ -174,7 +295,7 @@ case "$MODO" in
         # Usa a validacao ja preparada: a nova, se existir, ou a da rodada de 60 mil
         pasta_val="$DADOS"
         [ -f "$pasta_val/val_corpus_chunks.jsonl" ] || pasta_val="data/processed_tjrs"
-        CUDA_VISIBLE_DEVICES=0 python -u scripts/testar_carregamento.py --dados "$pasta_val" --processos 100 2>&1 | tee -a "$LOG"
+        CUDA_VISIBLE_DEVICES="${PLACAS[0]}" python -u scripts/testar_carregamento.py --dados "$pasta_val" --processos 100 2>&1 | tee -a "$LOG"
         ;;
     amostra)
         if [ -f "$AMOSTRA" ]; then
@@ -188,14 +309,15 @@ case "$MODO" in
         exigir_amostra
         exigir_espaco 60
         checar 2>&1 | tee -a "$LOG"
-        pipeline --steps split,chunk,mine,random --max_por_tribunal 500 --gpus 0,1
+        pipeline --steps split,chunk,mine,random --max_por_tribunal 500 --gpus "$GPUS"
         treinar 640
-        pipeline --steps eval --compare_baseline
+        # Mesma avaliacao do full (uma fila por placa e o comparativo no fim), sem o base do diagnostico
+        avaliar_teste
         ;;
     preparar)
         exigir_amostra
         exigir_espaco 50
-        pipeline --steps split,chunk,mine,random --gpus 0,1
+        pipeline --steps split,chunk,mine,random --gpus "$GPUS"
         ;;
     minerar)
         if [ ! -f "$DADOS/train_corpus_chunks.jsonl" ]; then
@@ -203,7 +325,7 @@ case "$MODO" in
             exit 1
         fi
         exigir_espaco 40
-        pipeline --steps mine,random --gpus 0,1
+        pipeline --steps mine,random --gpus "$GPUS"
         ;;
     diagnostico)
         if [ ! -f "$DADOS/train_tuplas_aleatorias.jsonl" ]; then
@@ -229,15 +351,15 @@ case "$MODO" in
         treinar ""
         ;;
     avaliar)
-        pipeline --steps eval --compare_baseline
+        avaliar_teste
         ;;
     completo)
         exigir_amostra
         exigir_espaco 185
         checar 2>&1 | tee -a "$LOG"
-        pipeline --steps split,chunk,mine,random --gpus 0,1
+        pipeline --steps split,chunk,mine,random --gpus "$GPUS"
         treinar ""
-        pipeline --steps eval --compare_baseline
+        avaliar_teste
         ;;
     *)
         sed -n '2,17p' "$0"

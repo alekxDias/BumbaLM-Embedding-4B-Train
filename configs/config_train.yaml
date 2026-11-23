@@ -28,10 +28,13 @@ lora:
   target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 treinamento:
-  # Lote contrastivo por GPU. Com as duas placas e gather_across_devices, cada ancora
-  # disputa com as outras 127 tuplas do passo.
+  # Lote contrastivo do passo, somando as placas: cada ancora disputa com as outras 127 tuplas.
+  # Cada GPU recebe lote_por_passo / numero de GPUs: 64 em cada uma de duas placas (com
+  # gather_across_devices os candidatos sao juntados) ou 128 numa so. A perda e a mesma; numa placa
+  # so, o passo leva ~2x mais tempo. A variante nenhum treinou nas duas placas; a partir de 17/11/2026
+  # so uma ficou disponivel, e aleatorios e dificeis foram treinadas nela (GPUS=<placa> no rodar.sh).
   # mini_batch_size so controla a memoria do GradCache, nao muda o resultado.
-  batch_size_train: 64
+  lote_por_passo: 128
   mini_batch_size: 16
   gradient_accumulation_steps: 1
 
@@ -48,9 +51,11 @@ treinamento:
   avaliar_no_inicio: true
 
   # Sorteia N tuplas (mesma semente nas tres variantes). null usa todas.
-  # A mineracao rende ~2,4 tuplas por acordao de treino (o teto relativo descarta ~75% dos chunks):
-  # 60 mil acordaos deram 116.419 tuplas; 100 mil devem dar ~195 mil (o artigo do TJMA usou 212.633).
-  limite_tuplas: null
+  # 100 mil acordaos com 1.000 candidatos deram 227.076 tuplas de 60.443 processos
+  # (com 400 candidatos eram 174.037; o artigo do TJMA usou 212.633).
+  # N igual ao total: entram todas, e o codigo ainda confere que as tres variantes usam
+  # exatamente os mesmos pares (o hash da lista vai para o melhor_checkpoint.json).
+  limite_tuplas: 227076
 
   # Otimizacao de alimentacao CPU -> GPU
   dataloader_num_workers: 4
@@ -63,10 +68,12 @@ treinamento:
   warmup_ratio: 0.05
   lr_scheduler_type: "cosine"
 
-  # Frequencia de checkpoints e avaliacao. 174.037 tuplas / 128 por passo = ~1.360 passos.
-  # 136: 10 validacoes, a ultima no fim do treino (mesma proporcao do Colab).
-  eval_steps: 136
-  save_steps: 136
+  # Frequencia de checkpoints e avaliacao. 227.076 tuplas / 128 por passo = 1.774 passos
+  # (174.037 deram 1.359, a mesma conta). 197: 9 validacoes, a ultima no passo 1.773.
+  # O ultimo passo do treino (1.774, ou antes se o sorteador sem duplicatas acabar mais cedo) tambem
+  # e validado e salvo: ValidarUltimoPassoCallback em src/training/trainer.py.
+  eval_steps: 197
+  save_steps: 197
   # 1: fica o ultimo e o melhor. Com pesos em fp32, cada checkpoint (pesos + Adam) tem ~48 GB.
   save_total_limit: 1
   metric_for_best_model: "val_cosine_ndcg@10"
@@ -86,6 +93,8 @@ avaliacao:
   # Um valor perto de zero indica modelo montado errado (foi o caso do diagnostico de 03/11/2026).
   mrr_minimo_passo0: 0.2
   # Precisao dos pesos na Etapa 5. fp32: testa exatamente o modelo que foi validado no treino.
+  # O base do diagnostico de 09/11/2026 foi medido em fp32 e o 'rodar.sh avaliar' reaproveita esse
+  # resultado; com outra precisao aqui, o base e medido de novo (~4 h em fp32 numa H200).
   precisao: "fp32"
   metricas:
     - "ndcg@10"

@@ -72,6 +72,50 @@ def carregar_pesos_lora(auto_model: torch.nn.Module, pasta: str | Path) -> int:
     return len(destinos)
 
 
+def carregar_pesos_checkpoint_completo(auto_model: torch.nn.Module, pasta: str | Path) -> tuple[int, int]:
+    """
+    Copia para o modelo os pesos de um checkpoint de full fine-tuning, conferindo tensor por tensor.
+
+    Se nao conseguir carregar o melhor checkpoint, o sentence-transformers so registra o erro e segue
+    com os pesos do ultimo passo: o modelo final seria outro, sem aviso. Esta funcao nao depende desse
+    carregamento e para com erro se o arquivo nao corresponder ao modelo.
+
+    Devolve (tensores conferidos, tensores que estavam diferentes e foram copiados).
+    """
+    from safetensors import safe_open
+
+    pasta = Path(pasta)
+    arquivos = sorted(pasta.glob("model*.safetensors"))
+    if not arquivos:
+        raise RuntimeError(f"Nenhum arquivo model*.safetensors em {pasta}: o melhor checkpoint nao pode ser conferido.")
+
+    alvos = auto_model.state_dict()
+    vistos: set[str] = set()
+    diferentes = 0
+    with torch.no_grad():
+        for arquivo in arquivos:
+            with safe_open(str(arquivo), framework="pt", device="cpu") as f:
+                for chave in f.keys():
+                    alternativas = (chave, f"model.{chave}", chave.removeprefix("model."))
+                    alvo = next((a for a in alternativas if a in alvos), None)
+                    if alvo is None:
+                        raise RuntimeError(f"Tensor '{chave}' de {arquivo} sem correspondente no modelo.")
+                    valor = f.get_tensor(chave)
+                    atual = alvos[alvo]
+                    if tuple(atual.shape) != tuple(valor.shape):
+                        raise RuntimeError(f"Formato diferente em '{alvo}': modelo {tuple(atual.shape)}, arquivo {tuple(valor.shape)}.")
+                    valor = valor.to(device=atual.device, dtype=atual.dtype)
+                    if not torch.equal(atual, valor):
+                        atual.copy_(valor)
+                        diferentes += 1
+                    vistos.add(alvo)
+
+    faltando = sorted(set(alvos) - vistos)
+    if faltando:
+        raise RuntimeError(f"{len(faltando)} tensores do modelo sem peso em {pasta} (ex.: {faltando[:2]}).")
+    return len(vistos), diferentes
+
+
 def _aplicar_lora(modelo: SentenceTransformer, cfg_lora: dict[str, Any], rank: str) -> None:
     """
     Adiciona adaptadores LoRA ao Transformer e congela o restante.

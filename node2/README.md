@@ -72,6 +72,14 @@ A rodada completa também pode ir por partes: `preparar`, depois `treinar` e dep
 
 **Se cair:** rode o mesmo comando de novo. A mineração retoma do último bloco de vetores, o treino retoma do último checkpoint e as variantes já concluídas são puladas.
 
+## 2c. Com uma GPU só
+
+Ponha `GPUS=<placa>` antes do comando, por exemplo `GPUS=1 bash node2/rodar.sh treinar`. O lote do passo continua 128 (`lote_por_passo` em `configs/config_train.yaml`): numa placa, as 128 tuplas ficam na mesma GPU, com os mesmos candidatos por âncora e a mesma perda das duas placas. Cada passo leva ~2x mais tempo (~130 s nas variantes com negativos, ~64 h por variante). No `avaliar`, os modelos entram em fila na placa escolhida (~4 h cada).
+
+Não troque o número de placas no meio de uma variante: o `04_train.py` para com erro quando o checkpoint foi gravado com outro lote por GPU. Para recomeçar a variante, apague a pasta dela em `experiments/`.
+
+Desde 17/11/2026 só uma placa está disponível. A `nenhum` treinou nas duas (64 por placa, candidatos juntados); `aleatorios` e `dificeis` treinam numa (128).
+
 ## 2a. Por que a amostra não filtra por órgão
 
 A rodada de 60 mil usou `--somente_camaras`, que classifica pelas palavras dos primeiros 4.000 caracteres do teor ("turma recursal", "recurso inominado", "juizado especial"). Numa conferência de 30 mil linhas do `pares_tjrs.jsonl`, os acórdãos marcados como Turma Recursal eram, nos exemplos, de Câmaras (3ª Câmara Criminal, 24ª Câmara Cível) que só citavam essas palavras. O grupo tinha teor completo (mediana de 13 mil caracteres) e menos ementa copiada no teor (0,23 contra 0,36). O filtro tirava ~29% dos acórdãos e enviesava os temas. A amostra de 100 mil é aleatória sobre o arquivo todo, e os riscos de atalho são tratados direto no texto: recorte do bloco da ementa, exclusão de chunks com vazamento, quase duplicatas no mesmo split e teto relativo na mineração.
