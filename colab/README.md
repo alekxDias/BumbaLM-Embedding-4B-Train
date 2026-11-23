@@ -7,6 +7,8 @@ O código de treino e avaliação é o mesmo do node2 (`scripts/04_train.py`, `s
 | Arquivo | Para que serve |
 |---|---|
 | `BumbaLM_colab.ipynb` | Notebook com todas as etapas, na ordem |
+| `BumbaLM_avaliacao_node2.ipynb` | Só a avaliação dos modelos treinados no node2 (nenhum e difíceis) e a tabela final |
+| `medir_velocidade_avaliacao.py` | Mede a velocidade da avaliação e estima horas e unidades |
 | `rodar.py` | Executor: `preparar`, `checar`, `testar_modelo`, `calibrar`, `treinar`, `avaliar`, `status` |
 | `configs/` | Configs do Colab. São copiadas para o Drive na 1ª sessão, e é a cópia do Drive que vale |
 | `../node2/exportar_para_colab.sh` | Empacota no node2 o que o Colab precisa |
@@ -27,6 +29,30 @@ O código de treino e avaliação é o mesmo do node2 (`scripts/04_train.py`, `s
 - a validação (300 processos, nDCG@10) e a avaliação no teste completo, com arquivos por consulta.
 
 **Os checkpoints do node2 não são usados.** O modelo base e as 3 variantes são treinados e avaliados do zero no Colab.
+
+## Só a avaliação dos modelos do node2: `BumbaLM_avaliacao_node2.ipynb`
+
+Desde 22/11/2026 não há mais acesso ao node2. A **aleatórios** não terminou lá, mas a **nenhum** e a **difíceis** terminaram (ajuste completo, 227.076 tuplas) e têm cópia conferida no Tapajós. O notebook `BumbaLM_avaliacao_node2.ipynb` fecha o experimento com elas, sem treinar nada:
+
+1. avalia no teste completo o **base**, a **nenhum** e a **difíceis**, os três em **TF32** numa A100 (pesos em fp32; só as multiplicações de matrizes usam os Tensor Cores TF32);
+2. confere o base em TF32 contra o base em fp32 medido no node2 (a diferença deve ficar na 3ª ou 4ª casa);
+3. monta a tabela final com o **BM25**, a divisão com e sem gêmeos, os **testes pareados** (aleatorização, bootstrap e Holm) e as curvas de validação, com `scripts/06_comparar_resultados.py`.
+
+Custo esperado: ~2–3 h de A100 por modelo, ~60 unidades no total. A célula 6 mede a velocidade real antes (`colab/medir_velocidade_avaliacao.py`).
+
+O que subir para o Drive (`MyDrive/BumbaLM_colab/`):
+
+| Pasta | Arquivos |
+|---|---|
+| `dados/` | já tem o pacote de 07/11 (os arquivos de teste são idênticos aos do node2) |
+| `modelos_node2/nenhum/` e `modelos_node2/dificeis/` | `best_model_4b/` inteira, `melhor_checkpoint.json` e, se tiver, `metricas_treino_val.csv` |
+| `modelos_node2/` | `SHA256SUMS_nenhum_dificeis.txt` (o notebook confere cada arquivo) |
+| `resultados_externos/bm25/` | `metricas_test_bm25.json` e `por_consulta_test_bm25.jsonl` |
+| `resultados_externos/base_fp32_node2/` | `metricas_test_baseline.json` e `por_consulta_test_baseline.jsonl` do diagnóstico |
+
+Sem espaço no Drive para os ~32 GB dos modelos, use um repositório privado do Hugging Face com a mesma estrutura e `ORIGEM_MODELOS = "hf"`.
+
+O `scripts/06_comparar_resultados.py` também roda no PC, sem GPU, sobre as pastas baixadas do Drive.
 
 ## Passo 1: exportar do node2 (uma vez)
 

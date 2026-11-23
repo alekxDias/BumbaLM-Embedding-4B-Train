@@ -42,7 +42,7 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 from src.evaluation.ir_evaluator import executar_avaliacao_completa, protocolo_do_split
-from src.hardware import dtype_para_dispositivo
+from src.hardware import aplicar_precisao_matmul, dtype_para_dispositivo
 from src.training.model_builder import carregar_pesos_lora
 
 logging.basicConfig(
@@ -155,9 +155,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--precisao",
         type=str,
-        choices=["auto", "fp16", "bf16", "fp32"],
+        choices=["auto", "fp16", "bf16", "fp32", "tf32"],
         default=None,
-        help="Precisao dos pesos na inferencia. Padrao: avaliacao.precisao do YAML ou auto (fp16 na V100).",
+        help=(
+            "Precisao na inferencia. Padrao: avaliacao.precisao do YAML ou auto (fp16 na V100). "
+            "tf32: pesos em fp32 e multiplicacoes de matrizes nos Tensor Cores TF32 (A100 em diante)."
+        ),
     )
     return parser.parse_args()
 
@@ -417,6 +420,9 @@ def main() -> None:
     )
     max_seq_length = int(modelo_cfg.get("max_seq_length", 768))
     precisao = args.precisao or str(cfg_train.get("avaliacao", {}).get("precisao", "auto"))
+    # Antes de carregar qualquer modelo. A precisao vai para configuracao_avaliacao: um resultado em
+    # fp32 nao e reaproveitado numa avaliacao em tf32, e vice-versa.
+    modo_matmul = aplicar_precisao_matmul(precisao)
     if args.batch_size is None:
         args.batch_size = int(cfg_train.get("avaliacao", {}).get("eval_batch_size", 32))
     splits_para_avaliar = ["test"] if args.split == "test" else (["val"] if args.split == "val" else ["val", "test"])
@@ -430,6 +436,7 @@ def main() -> None:
     print(f"Diretorio de Dados   : {dir_processados}")
     print(f"Diretorio de Saida   : {dir_saida}")
     print(f"Batch Size Avaliacao : {args.batch_size} | Max tokens: {max_seq_length} | Precisao: {precisao}")
+    print(f"Matmul em fp32       : {modo_matmul} ('high' = TF32, 'highest' = fp32 puro)")
     print("-" * 64)
 
     # Arquivos de cada split, resolvidos uma vez
